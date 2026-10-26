@@ -39,6 +39,14 @@ On each monitored host:
 
 Non-Linux and offline peers are listed as "not probed".
 
+## Installation
+
+tailmon is a single script. To run it as `tailmon` from anywhere, link it into a directory on your `PATH`:
+
+```sh
+mkdir -p ~/.local/bin && ln -s "$PWD/tailmon.py" ~/.local/bin/tailmon
+```
+
 ## Manual page
 
 A man page is included. Read it in place with `man -l tailmon.1`, or install it:
