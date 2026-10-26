@@ -1,0 +1,330 @@
+.TH TAILMON 1 "October 2026" "tailmon" "User Commands"
+.SH NAME
+tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Tailscale tailnet
+.SH SYNOPSIS
+.B tailmon
+.RB [ \-w
+.IR SEC ]
+.RB [ \-\-json ]
+.RB [ \-\-log
+.IR FILE ]
+.RB [ \-\-quiet ]
+.RB [ \-\-hosts
+.IR LIST ]
+.br
+.B tailmon search
+.RI [ PATH ]
+.RB [ \-\-name
+.IR GLOB ]
+.RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-max\-results
+.IR N ]
+.RB [ \-\-hidden ]
+.RB [ \-\-json ]
+.br
+.B tailmon grep
+.I PATTERN
+.RI [ PATH ]
+.RB [ \-i ]
+.RB [ \-\-fixed\-strings ]
+.RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-max\-results
+.IR N ]
+.RB [ \-\-hidden ]
+.RB [ \-\-json ]
+.SH DESCRIPTION
+.B tailmon
+shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
+and SLURM state for every online Linux machine on your Tailscale network.
+.PP
+Hosts are discovered with
+.BR "tailscale status \-\-json" .
+Each online Linux peer is probed over
+.BR ssh (1)
+by piping a small, standard\-library\-only Python script to
+.B "python3 \-"
+on the remote side. Nothing is installed, copied or left behind on the monitored hosts.
+The local machine is probed directly, without SSH.
+.PP
+Non\-Linux and offline peers are listed as \(lqnot probed\(rq.
+.PP
+The
+.B search
+and
+.B grep
+subcommands use the same mechanism to find files by name, or lines by content,
+on all online Linux peers at once.
+.SH OPTIONS
+.TP
+.BR \-w ", " \-\-watch " " \fISEC\fR
+Live view, refreshed every
+.I SEC
+seconds. One persistent SSH session per host streams samples; dropped connections are
+retried every 10 seconds, and the tailnet is re\-scanned every
+.B discover_seconds
+(see
+.BR CONFIGURATION )
+so that hosts joining or leaving are picked up. Ignored with
+.BR \-\-json .
+.TP
+.B \-\-json
+Print a single JSON snapshot (an array with one object per host) and exit.
+.TP
+.BI \-\-log " FILE"
+Append each sample to
+.I FILE
+as JSON Lines, one object per host per sample. Combine with
+.B \-w
+to keep a history.
+.TP
+.B \-\-quiet
+Do not draw the table. Meant for use with
+.B \-\-log
+from
+.BR cron (8)
+or
+.BR systemd (1).
+.TP
+.BI \-\-hosts " LIST"
+Only probe these comma\-separated Tailscale hostnames.
+.TP
+.BR \-h ", " \-\-help
+Show a short help message and exit.
+.SH SUBCOMMANDS
+.SS "search [PATH]"
+Find regular files whose name matches a glob under
+.I PATH
+(default: the remote user's home directory, i.e.\&
+.BR . ).
+Symbolic links to directories are not followed. Output is one
+.IB host ": " path
+line per match.
+.TP
+.BI \-\-name " GLOB"
+Shell\-style filename pattern, e.g.\&
+.BR \(aq*.log\(aq .
+Default:
+.BR * .
+Quote it so your local shell does not expand it.
+.SS "grep PATTERN [PATH]"
+Search the contents of text files under
+.I PATH
+(default
+.BR . )
+for lines matching
+.IR PATTERN ,
+a Python regular expression
+(see
+.BR re
+in the Python documentation, not POSIX
+.BR regex (7)).
+Files whose first 8 KiB contain a NUL byte are treated as binary and skipped.
+Output is one
+.IB host : path : line ": " text
+line per match.
+.TP
+.BR \-i ", " \-\-ignore\-case
+Match case\-insensitively.
+.TP
+.B \-\-fixed\-strings
+Treat
+.I PATTERN
+as literal text rather than a regular expression.
+.SS "Options common to search and grep"
+.TP
+.BI \-\-hosts " LIST"
+Only search these comma\-separated Tailscale hostnames.
+.TP
+.BI \-\-max\-results " N"
+Stop after
+.I N
+results. Default: 1000.
+.TP
+.B \-\-hidden
+Include files and directories whose name starts with a dot (skipped by default).
+.TP
+.B \-\-json
+Print
+.B {"results": [...], "errors": [...], "skipped": [...]}
+instead of text.
+.PP
+Per\-host errors and the list of hosts that were not searched are written to standard error.
+Each host has 60 seconds to answer.
+.SH OUTPUT
+For each host the table shows a header line (name, core count, load average) followed by:
+.TP 8
+.B CPU
+Utilization over the sample interval, from
+.IR /proc/stat .
+.TP
+.B RAM
+Used memory (total minus
+.BR MemAvailable )
+and swap, from
+.IR /proc/meminfo .
+.TP
+.B GPU
+Per NVIDIA GPU: utilization, memory and temperature, when
+.BR nvidia\-smi (1)
+is available.
+.TP
+.B IO
+Disk read/write throughput from
+.I /proc/diskstats
+(physical disks only) and network rx/tx from
+.I /proc/net/dev
+(excluding loopback, docker, veth, bridges and tailscale interfaces).
+.TP
+.B HDD
+Usage of local filesystems of at least 1 GiB (ext*, xfs, btrfs, zfs, ...), with inode usage
+when the filesystem reports it, plus a per\-host total.
+.TP
+.B TOTAL
+Storage summed over all hosts. Shown only when at most one Linux host is offline or
+unreachable, in which case it is marked incomplete. Excluded and non\-Linux peers do not count.
+.TP
+.B USERS
+Interactive logins from
+.BR who (1);
+people other than the SSH user are highlighted.
+.TP
+.B SLURM
+Node state, CPU allocation and the job queue from
+.BR sinfo (1)
+and
+.BR squeue (1),
+when installed (refreshed at most every 10 seconds). Hosts reporting the same cluster show it once.
+.PP
+Bars and percentages are green below 70%, yellow from 70% and red from 90%.
+Colors are only used when standard output is a terminal.
+.SH CONFIGURATION
+An optional JSON file,
+.IR ~/.config/tailmon.json ,
+overrides any of the built\-in defaults:
+.PP
+.RS
+.nf
+{
+  "users": {"gpu\-box": "alice"},
+  "default_user": "admin",
+  "identity": "~/.ssh/id_ed25519",
+  "exclude": ["printer\-pi"],
+  "sample_seconds": 1.0,
+  "discover_seconds": 30.0
+}
+.fi
+.RE
+.TP
+.B users
+SSH user per Tailscale hostname.
+.TP
+.B default_user
+SSH user for hosts not listed in
+.BR users .
+Default
+.BR null :
+whatever
+.BR ssh (1)
+would pick (\fI~/.ssh/config\fR or your local username).
+.TP
+.B identity
+SSH private key passed with
+.BR \-i .
+Default
+.BR null :
+your usual keys or agent.
+.TP
+.B exclude
+Tailscale hostnames never to probe or search.
+.TP
+.B sample_seconds
+Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
+.TP
+.B discover_seconds
+In watch mode, how often to re\-run
+.B tailscale status
+to find new or departed hosts. Default 30.0.
+.SH SSH
+.B tailmon
+runs
+.BI "ssh " short\-name
+with the Tailscale address pinned as
+.BR HostName ,
+so
+.BI "Host " short\-name
+entries in
+.I ~/.ssh/config
+.RB ( User ,
+.BR IdentityFile ,
+\&...) apply as they would for a plain
+.BR "ssh short\-name" .
+Connections use
+.B BatchMode=yes
+(never prompt for a password) and
+.BR StrictHostKeyChecking=accept\-new ,
+so key\-based, non\-interactive access is required.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set, disable colors.
+.SH FILES
+.TP
+.I ~/.config/tailmon.json
+Optional configuration file.
+.TP
+.I ~/.ssh/config
+Per\-host SSH settings, honored as described above.
+.SH REQUIREMENTS
+On the machine running
+.BR tailmon :
+Python 3.6 or later, the
+.BR tailscale (1)
+CLI logged in to the tailnet, and
+.BR ssh (1).
+.PP
+On each monitored host: Linux with
+.B python3
+3.6 or later on the
+.BR PATH ;
+optionally
+.BR nvidia\-smi (1),
+.BR who (1),
+.BR sinfo (1)
+and
+.BR squeue (1).
+.SH EXAMPLES
+.TP
+.B tailmon
+One snapshot of every online Linux node.
+.TP
+.B tailmon \-w 1
+Live view, refreshed every second.
+.TP
+.B tailmon \-\-hosts web\-1,db\-1
+Only these two hosts.
+.TP
+.B tailmon \-\-json
+Machine\-readable snapshot.
+.TP
+.B tailmon \-w 60 \-\-log m.jsonl \-\-quiet
+Record one sample per host per minute without drawing, e.g.\& from a systemd service.
+.TP
+.B tailmon search /var/log \-\-name \(aq*.log\(aq
+Find log files on every peer.
+.TP
+.B tailmon grep \(aqERROR|WARN\(aq /var/log \-i
+Grep file contents across the tailnet.
+.TP
+.B tailmon grep \-\-fixed\-strings needle /home \-\-hosts server\-1 \-\-json
+Literal search on one host, as JSON.
+.SH SEE ALSO
+.BR tailscale (1),
+.BR ssh (1),
+.BR ssh_config (5),
+.BR nvidia\-smi (1),
+.BR sinfo (1),
+.BR squeue (1)
+.SH LICENSE
+MIT.

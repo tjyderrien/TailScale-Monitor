@@ -39,6 +39,16 @@ On each monitored host:
 
 Non-Linux and offline peers are listed as "not probed".
 
+## Manual page
+
+A man page is included. Read it in place with `man -l tailmon.1`, or install it:
+
+```sh
+mkdir -p ~/.local/share/man/man1 && cp tailmon.1 ~/.local/share/man/man1/   # just for you
+sudo install -m644 tailmon.1 /usr/local/share/man/man1/ && sudo mandb        # system-wide
+man tailmon
+```
+
 ## Usage
 
 ```sh
