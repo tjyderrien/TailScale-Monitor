@@ -21,6 +21,8 @@ server-1         64 cores  load 0.10 0.07 0.07
 - **Live view.** `-w 1` keeps one SSH session per host open and streams a sample every second. Hosts that
   join or leave the tailnet are picked up automatically, and dropped connections are retried.
 - **NVIDIA GPUs** are reported (utilization, memory, temperature) when `nvidia-smi` is available.
+- **Tailnet file tools.** `search` finds files by name and `grep` searches their contents across all
+  online Linux peers, without installing anything on them.
 
 ## Requirements
 
@@ -47,7 +49,15 @@ Non-Linux and offline peers are listed as "not probed".
 ./tailmon.py --json                  # machine-readable snapshot
 ./tailmon.py -w 60 --log m.jsonl     # keep a history: one JSON object per host per sample
 ./tailmon.py -w 60 --log m.jsonl --quiet   # same, without drawing (for cron / systemd)
+./tailmon.py search /var/log --name '*.log' # find matching files on every peer
+./tailmon.py grep 'ERROR|WARN' /var/log -i  # grep file contents across the tailnet
+./tailmon.py grep --fixed-strings 'needle' /home --hosts server-1 --json
 ```
+
+`search` and `grep` use the same SSH configuration as monitoring. They skip hidden files by default,
+limit output to 1,000 results, and only search online Linux peers. Use `--hidden`, `--max-results N`,
+`--hosts host1,host2`, and `--json` as needed. `grep` uses Python regular expressions; use
+`--fixed-strings` for literal text.
 
 Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1` to disable them.
 
