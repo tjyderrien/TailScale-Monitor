@@ -34,6 +34,22 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .IR N ]
 .RB [ \-\-hidden ]
 .RB [ \-\-json ]
+.br
+.B tailmon mount
+.RB [ \-\-path
+.IR DIR ]
+.RB [ \-\-root
+.IR DIR ]
+.RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-json ]
+.br
+.B tailmon umount
+.RB [ \-\-root
+.IR DIR ]
+.RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-json ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -56,6 +72,10 @@ and
 .B grep
 subcommands use the same mechanism to find files by name, or lines by content,
 on all online Linux peers at once.
+The
+.B mount
+subcommand mounts every peer's filesystem under one local directory with
+.BR sshfs (1).
 .SH OPTIONS
 .TP
 .BR \-w ", " \-\-watch " " \fISEC\fR
@@ -152,6 +172,41 @@ instead of text.
 .PP
 Per\-host errors and the list of hosts that were not searched are written to standard error.
 Each host has 60 seconds to answer.
+.SS "mount"
+Mount each online Linux peer with
+.BR sshfs (1)
+at
+.IB ROOT / host
+(default root:
+.IR /media/tailscale ),
+so local programs can work on files from all machines at once.
+The local machine gets a symbolic link instead of a mount.
+Hosts that are already mounted are left alone; stale mounts of hosts that went away are
+replaced. Mounts use the same SSH settings as the probes, run as your SSH user, are
+read\-write, and reconnect after network drops. They do not survive a reboot.
+.TP
+.BI \-\-path " DIR"
+Remote directory to mount. Default:
+.BR / .
+.TP
+.BI \-\-root " DIR"
+Local directory that holds one mount per host. It must be writable by you; for the default, create it once with
+.BR "sudo install \-d \-o $USER \-g $(id \-gn) /media/tailscale" .
+.SS "umount"
+Unmount every mount (and remove every symbolic link) that
+.B mount
+created under the root. Takes
+.B \-\-root
+as above.
+.SS "Options common to mount and umount"
+.TP
+.BI \-\-hosts " LIST"
+Only these comma\-separated Tailscale hostnames.
+.TP
+.B \-\-json
+Print
+.B {"results": [...], "skipped": [...]}
+instead of text.
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -319,10 +374,18 @@ Grep file contents across the tailnet.
 .TP
 .B tailmon grep \-\-fixed\-strings needle /home \-\-hosts server\-1 \-\-json
 Literal search on one host, as JSON.
+.TP
+.B tailmon mount
+Mount the root filesystem of every peer at
+.IR /media/tailscale/ host .
+.TP
+.B tailmon umount
+Unmount them again.
 .SH SEE ALSO
 .BR tailscale (1),
 .BR ssh (1),
 .BR ssh_config (5),
+.BR sshfs (1),
 .BR nvidia\-smi (1),
 .BR sinfo (1),
 .BR squeue (1)

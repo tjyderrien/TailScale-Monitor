@@ -1,6 +1,7 @@
 # tailmon
 
-Agentless CPU / GPU / RAM / IO / disk monitor for the machines on your [Tailscale](https://tailscale.com) tailnet.
+Agentless CPU / GPU / RAM / IO / disk monitor for the machines on your [Tailscale](https://tailscale.com) tailnet,
+plus tools to find, grep and open files on all of them at once.
 
 ```
 tailmon  2026-10-19 19:52:13
@@ -23,6 +24,9 @@ server-1         64 cores  load 0.10 0.07 0.07
 - **NVIDIA GPUs** are reported (utilization, memory, temperature) when `nvidia-smi` is available.
 - **Tailnet file tools.** `search` finds files by name and `grep` searches their contents across all
   online Linux peers, without installing anything on them.
+- **Tailnet mounts.** `mount` puts every online Linux peer's filesystem under `/media/tailscale/<host>` with
+  `sshfs`, so ordinary programs (image viewers, scripts, …) can open files from all machines at once,
+  with the same path layout on every host.
 
 ## Requirements
 
@@ -31,11 +35,13 @@ On the machine running tailmon:
 - Python ≥ 3.6
 - `tailscale` CLI, logged in to your tailnet
 - `ssh` with key-based (non-interactive) access to the hosts you want to monitor
+- for `mount` only: `sshfs` (FUSE; e.g. `sudo apt install sshfs`)
 
 On each monitored host:
 
 - Linux with `python3` ≥ 3.6 on the `PATH` (the probe reads `/proc` and `/sys`)
 - optionally `nvidia-smi` for GPU stats
+- for `mount`: SFTP enabled in `sshd` (the OpenSSH default)
 
 Non-Linux and offline peers are listed as "not probed".
 
@@ -59,6 +65,8 @@ man tailmon
 
 ## Usage
 
+### Monitoring
+
 ```sh
 ./tailmon.py                         # one snapshot of every online Linux node
 ./tailmon.py -w 1                    # live view, refreshed every second
@@ -67,9 +75,19 @@ man tailmon
 ./tailmon.py --json                  # machine-readable snapshot
 ./tailmon.py -w 60 --log m.jsonl     # keep a history: one JSON object per host per sample
 ./tailmon.py -w 60 --log m.jsonl --quiet   # same, without drawing (for cron / systemd)
+```
+
+Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1` to disable them.
+
+### Files across the tailnet
+
+```sh
 ./tailmon.py search /var/log --name '*.log' # find matching files on every peer
 ./tailmon.py grep 'ERROR|WARN' /var/log -i  # grep file contents across the tailnet
 ./tailmon.py grep --fixed-strings 'needle' /home --hosts server-1 --json
+./tailmon.py mount                          # every peer's / at /media/tailscale/<host>
+./tailmon.py mount --path /data --hosts gpu-box,server-1
+./tailmon.py umount                         # unmount everything under /media/tailscale
 ```
 
 `search` and `grep` use the same SSH configuration as monitoring. They skip hidden files by default,
@@ -77,7 +95,23 @@ limit output to 1,000 results, and only search online Linux peers. Use `--hidden
 `--hosts host1,host2`, and `--json` as needed. `grep` uses Python regular expressions; use
 `--fixed-strings` for literal text.
 
-Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1` to disable them.
+`mount` makes the whole tailnet look like one directory tree, so any local tool works on it:
+
+```sh
+tailmon mount
+ls /media/tailscale/                              # one entry per host
+du -sh /media/tailscale/*/data/results            # same path on every machine
+eog /media/tailscale/gpu-box/home/me/plots/*.png  # open remote files with local programs
+tailmon umount
+```
+
+`mount` needs `sshfs` locally (`sudo apt install sshfs`) and a mount root you own; create it once with
+`sudo install -d -o $USER -g $(id -gn) /media/tailscale`, or pick another one with `--root DIR`. Each peer is
+mounted read-write as your SSH user at `/media/tailscale/<host>` (the `--path` directory, `/` by default); the
+local machine gets a symlink there instead, so all hosts share one path layout. Mounts reconnect after
+network drops; running `mount` again only fills in missing or stale ones. `umount` also takes `--hosts`.
+Mounts don't survive a reboot: run `tailmon mount` again (e.g. from your session startup).
+Don't run it with `sudo`: it must use your own SSH keys and user.
 
 ## Configuration
 

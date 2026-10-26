@@ -10,6 +10,7 @@ the local machine is probed directly.
     tailmon.py -w 60 --log m.jsonl   keep a history (one JSON object per host per sample)
     tailmon.py --json             machine-readable snapshot
     tailmon.py --hosts web-1,db-1
+    tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
 """
 import argparse
 import concurrent.futures as cf
@@ -411,6 +412,148 @@ def render_file_results(operation, rows, errors, skipped, as_json):
         print("not searched: " + ", ".join(p["name"] for p in skipped), file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------------------------
+# Mounts: each peer's filesystem under one local directory via sshfs (FUSE, no root needed).
+# ---------------------------------------------------------------------------------------------
+MOUNT_ROOT = "/media/tailscale"
+
+
+def mounted_paths():
+    """Mount points currently in /proc/mounts (with its octal escapes such as \\040 decoded)."""
+    with open("/proc/mounts") as f:
+        return {line.split()[1].encode().decode("unicode_escape") for line in f}
+
+
+def fusermount(*args):
+    exe = shutil.which("fusermount3") or "fusermount"
+    return subprocess.run([exe] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+
+def sshfs_cmd(node, cfg, remote, point):
+    user = cfg["users"].get(node["name"], cfg["default_user"])
+    host = "%s@%s" % (user, node["name"]) if user else node["name"]
+    # Same SSH settings as the probes; sshfs forwards these -o options to ssh.
+    opts = ["BatchMode=yes", "ConnectTimeout=8", "StrictHostKeyChecking=accept-new",
+            "ServerAliveInterval=15", "ServerAliveCountMax=3", "reconnect", "idmap=user",
+            "HostName=%s" % (node["dns"] or node["ip"])]
+    if cfg.get("identity"):
+        opts.append("IdentityFile=%s" % os.path.expanduser(cfg["identity"]))
+    return ["sshfs", "%s:%s" % (host, remote), point, "-o", ",".join(opts)]
+
+
+def mount_host(node, cfg, is_self, root, remote, mounted):
+    """Mount one host at root/<name> (the local machine gets a symlink); return a status row."""
+    point = os.path.join(root, node["name"])
+    row = {"node": node["name"], "mount": point}
+    if is_self:
+        if os.path.islink(point) and os.readlink(point) == remote:
+            return dict(row, status="already linked")
+        if os.path.lexists(point):
+            return dict(row, error="%s exists and is not a link to %s" % (point, remote))
+        os.symlink(remote, point)
+        return dict(row, status="linked (local machine)")
+    if point in mounted:
+        try:
+            os.stat(point)
+            return dict(row, status="already mounted")
+        except OSError:
+            fusermount("-uz", point)  # stale mount (host went away): drop it and mount again
+    try:
+        os.makedirs(point, exist_ok=True)
+    except OSError as exc:
+        return dict(row, error=str(exc))
+    try:
+        r = subprocess.run(sshfs_cmd(node, cfg, remote, point), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        r = None
+    if r is None or r.returncode != 0:
+        try:
+            os.rmdir(point)
+        except OSError:
+            pass
+        err = "timeout" if r is None else (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+        return dict(row, error=err[:160])
+    return dict(row, status="mounted %s" % remote)
+
+
+def unmount_all(root, only):
+    rows = []
+    mounted = mounted_paths()
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        if only and name not in only:
+            continue
+        point = os.path.join(root, name)
+        if os.path.islink(point):
+            os.unlink(point)
+            rows.append({"node": name, "mount": point, "status": "unlinked"})
+        elif point in mounted:
+            r = fusermount("-u", point)
+            if r.returncode != 0:
+                err = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+                rows.append({"node": name, "mount": point, "error": err[:160]})
+                continue
+            os.rmdir(point)
+            rows.append({"node": name, "mount": point, "status": "unmounted"})
+        elif os.path.isdir(point) and not os.listdir(point):
+            os.rmdir(point)  # leftover empty mount point
+    return rows
+
+
+def mount_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon " + argv[0],
+                                 description="Mount the filesystems of the Tailscale peers with sshfs, "
+                                             "one directory per host" if argv[0] == "mount"
+                                 else "Unmount what `tailmon mount` mounted")
+    ap.add_argument("--root", default=MOUNT_ROOT, help="local directory holding one mount per host "
+                                                        "(default %(default)s)")
+    ap.add_argument("--hosts", help="comma-separated Tailscale hostnames")
+    ap.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    if argv[0] == "mount":
+        ap.add_argument("--path", default="/", help="remote directory to mount (default %(default)s)")
+    a = ap.parse_args(argv[1:])
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    root = os.path.abspath(os.path.expanduser(a.root))
+
+    skipped = []
+    if argv[0] == "umount":
+        rows = unmount_all(root, only)
+    else:
+        if not shutil.which("sshfs"):
+            sys.exit("tailmon: sshfs is not installed (e.g. `sudo apt install sshfs`)")
+        # As root, ssh would use root's keys and log in as root: run as yourself instead.
+        if os.geteuid() == 0:
+            sys.exit("tailmon: don't run `mount` as root (no sudo); run it as your own user")
+        try:
+            os.makedirs(root, exist_ok=True)
+        except PermissionError:
+            pass
+        if not os.access(root, os.W_OK):
+            sys.exit("tailmon: %s is missing or not writable by you; create it once with\n"
+                     "  sudo install -d -o $USER -g $(id -gn) %s" % (root, root))
+        cfg = load_config()
+        targets, skipped = targets_for(cfg, only)
+        mounted = mounted_paths()
+        with cf.ThreadPoolExecutor(max_workers=16) as ex:
+            futs = [ex.submit(mount_host, n, cfg, is_self, root, a.path, mounted) for n, is_self in targets]
+            rows = [f.result() for f in futs]
+
+    if a.json:
+        print(json.dumps({"results": rows, "skipped": [p["name"] for p in skipped]}, indent=2))
+        return
+    for row in rows:
+        if "error" in row:
+            print("%-16s %s" % (row["node"], c("ERROR: " + row["error"], 100)), file=sys.stderr)
+        else:
+            print("%-16s %-28s %s" % (row["node"], row["mount"], row["status"]))
+    if not rows:
+        print("nothing to %s under %s" % (argv[0], root))
+    if skipped:
+        print("not mounted: " + ", ".join(
+            "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped), file=sys.stderr)
+
+
 class Stream:
     """One long-lived probe per host that prints a sample every `interval` seconds; reconnects if it dies."""
     RETRY = 10.0
@@ -706,6 +849,8 @@ def file_main(argv):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("search", "grep"):
         return file_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] in ("mount", "umount"):
+        return mount_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")
