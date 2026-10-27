@@ -96,10 +96,11 @@ tailmon mount --path /data --hosts gpu-box,server-1
 tailmon umount                                    # unmount everything under /media/tailscale
 ```
 
-`search` and `grep` use the same SSH configuration as monitoring. They skip hidden files by default,
-limit output to 1,000 results, and only search online Linux peers. Use `--hidden`, `--max-results N`,
-`--hosts host1,host2`, and `--json` as needed. `grep` uses Python regular expressions; use
-`--fixed-strings` for literal text.
+`search` and `grep` use the same SSH configuration as monitoring. They skip hidden files, `/proc` and
+sshfs mounts below the root (peers under `/media/tailscale` can mount each other in a loop; `--boom`
+lifts this guard) by default, limit output to 1,000 results, and only search online Linux peers. Use
+`--hidden`, `--proc`, `--boom`, `--max-results N`, `--hosts host1,host2`, and `--json` as needed. `grep`
+uses Python regular expressions; use `--fixed-strings` for literal text.
 
 Each host gets 300 seconds (`--timeout SEC`, `0` for no limit); a host that runs out of time keeps what
 it found so far, and the error says which path it was reading. `-v` prints a per-host summary (matches,

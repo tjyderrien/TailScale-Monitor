@@ -21,6 +21,8 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-max\-results
 .IR N ]
 .RB [ \-\-hidden ]
+.RB [ \-\-proc ]
+.RB [ \-\-boom ]
 .RB [ \-\-timeout
 .IR SEC ]
 .RB [ \-v | \-vv ]
@@ -36,6 +38,8 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-max\-results
 .IR N ]
 .RB [ \-\-hidden ]
+.RB [ \-\-proc ]
+.RB [ \-\-boom ]
 .RB [ \-\-timeout
 .IR SEC ]
 .RB [ \-v | \-vv ]
@@ -174,6 +178,30 @@ results. Default: 1000.
 .TP
 .B \-\-hidden
 Include files and directories whose name starts with a dot (skipped by default).
+.TP
+.B \-\-proc
+Also walk into
+.I /proc
+when searching a directory above it, such as
+.IR / .
+It is skipped by default: its pseudo\-files are endless and rarely what you want.
+Giving
+.I /proc
+itself as
+.I PATH
+searches it either way.
+.TP
+.B \-\-boom
+Disable the loop guard. By default the walk does not enter sshfs mounts below
+.I PATH
+(such as
+.IR /media/tailscale ,
+where peers mounted with
+.B tailmon mount
+can mount each other again, without end) and never reads the same directory twice
+(bind mounts of a parent). An sshfs mount given as
+.I PATH
+itself is searched either way.
 .TP
 .B \-\-json
 Print

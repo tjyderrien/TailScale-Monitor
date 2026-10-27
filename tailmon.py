@@ -216,6 +216,24 @@ include_hidden = sys.argv[5] == "1"
 ignore_case = sys.argv[6] == "1"
 fixed = sys.argv[7] == "1"
 progress_every = float(sys.argv[8]) if len(sys.argv) > 8 else 0.0  # 0 = no progress reports
+include_proc = len(sys.argv) > 9 and sys.argv[9] == "1"  # walk into /proc when the root is above it
+boom = len(sys.argv) > 10 and sys.argv[10] == "1"  # no loop guard: follow sshfs mounts and revisited dirs
+
+def sshfs_mounts():
+    # Mount points of sshfs filesystems (e.g. `tailmon mount` under /media/tailscale): each one is
+    # another host's tree, which can hold sshfs mounts of this host again, without end.
+    points = set()
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) > 2 and fields[2] == "fuse.sshfs":
+                    points.add(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1]))
+    except OSError:
+        pass
+    return points
+
+blocked = set() if boom else sshfs_mounts()
 started = time.time()
 lock = threading.Lock()
 # "frac" is the share of the tree already behind the walk: each directory splits its parent's share
@@ -246,9 +264,19 @@ def walk(top):
     # Depth-first like os.walk(topdown=True, followlinks=False), and also yields the share of the tree done.
     # Depth counts directory levels below the root (the root itself is 0).
     stack = [(top, 0.0, 1.0, 0)]
+    seen = set()
     while stack:
         directory, done, share, depth = stack.pop()
         state["path"], state["frac"], state["depth"] = directory, done, depth
+        if not boom:
+            # The same directory reached twice (a bind mount of a parent, say) would loop forever.
+            try:
+                st = os.stat(directory)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
         try:
             entries = list(os.scandir(directory))
         except OSError:
@@ -269,6 +297,11 @@ def walk(top):
         dirs.sort()
         step = share / len(dirs) if dirs else 0.0
         for i in reversed(range(len(dirs))):
+            child = os.path.abspath(os.path.join(directory, dirs[i]))
+            if not include_proc and child == "/proc":
+                continue  # endless pseudo-files; searching /proc itself as the root still works
+            if child in blocked:
+                continue  # only mounts below the root: giving an sshfs mount as the root still works
             stack.append((os.path.join(directory, dirs[i]), done + i * step, step, depth + 1))
 
 def found(row):
@@ -408,9 +441,11 @@ FILE_TIMEOUT = 300.0  # seconds per host for search/grep; big multi-disk trees n
 PROGRESS_SECONDS = 0.5  # how often a host reports its position with -vv (only when it changed)
 
 
-def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed, progress):
+def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed, progress,
+                  proc=False, boom=False):
     args = ["-", operation, root, pattern, str(limit), "1" if hidden else "0",
-            "1" if ignore_case else "0", "1" if fixed else "0", str(PROGRESS_SECONDS if progress else 0)]
+            "1" if ignore_case else "0", "1" if fixed else "0", str(PROGRESS_SECONDS if progress else 0),
+            "1" if proc else "0", "1" if boom else "0"]
     if is_self:
         return [sys.executable] + args
     user = cfg["users"].get(node["name"], cfg["default_user"])
@@ -523,13 +558,14 @@ class ProgressBoard:
 
 
 def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=False, fixed=False,
-              verbose=0, timeout=0):
+              verbose=0, timeout=0, proc=False, boom=False):
     targets, skipped = targets_for(cfg, only)
     jobs = [FileJob(n) for n, _ in targets]
     board = ProgressBoard(jobs) if verbose >= 2 and sys.stderr.isatty() else None
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         futs = [ex.submit(job.run, file_tool_cmd(n, cfg, is_self, operation, root, pattern, limit, hidden,
-                                                 ignore_case, fixed, board is not None), timeout)
+                                                 ignore_case, fixed, board is not None, proc, boom),
+                                 timeout)
                 for job, (n, is_self) in zip(jobs, targets)]
         try:
             while board and not all(f.done() for f in futs):
@@ -983,6 +1019,11 @@ def file_main(argv):
         parser.add_argument("--max-results", type=int, default=1000, metavar="N",
                             help="maximum results across all hosts")
         parser.add_argument("--hidden", action="store_true", help="include hidden files and directories")
+        parser.add_argument("--proc", action="store_true",
+                            help="also walk into /proc (skipped by default when searching above it)")
+        parser.add_argument("--boom", action="store_true",
+                            help="disable the loop guard: walk into sshfs mounts (e.g. /media/tailscale, "
+                                 "where peers mount each other) and directories already visited")
         parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
         parser.add_argument("--timeout", type=float, default=FILE_TIMEOUT, metavar="SEC",
                             help="give up on a host after SEC seconds, keeping what it found "
@@ -1015,7 +1056,7 @@ def file_main(argv):
                                               a.max_results, a.hidden,
                                               getattr(a, "ignore_case", False),
                                               getattr(a, "fixed_strings", False),
-                                              a.verbose, a.timeout)
+                                              a.verbose, a.timeout, a.proc, a.boom)
     render_file_results(a.operation, rows, errors, skipped, stats, a.json, a.verbose)
 
 
