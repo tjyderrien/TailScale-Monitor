@@ -217,7 +217,7 @@ started = time.time()
 lock = threading.Lock()
 # "frac" is the share of the tree already behind the walk: each directory splits its parent's share
 # evenly among its subdirectories. "path" is the directory (or, for grep, the file) being read.
-state = {"path": root, "frac": 0.0, "dirs": 0, "files": 0, "found": 0}
+state = {"path": root, "frac": 0.0, "dirs": 0, "files": 0, "found": 0, "depth": 0, "max_depth": 0}
 
 def wanted(name):
     return include_hidden or not name.startswith(".")
@@ -241,15 +241,17 @@ def heartbeat():
 
 def walk(top):
     # Depth-first like os.walk(topdown=True, followlinks=False), and also yields the share of the tree done.
-    stack = [(top, 0.0, 1.0)]
+    # Depth counts directory levels below the root (the root itself is 0).
+    stack = [(top, 0.0, 1.0, 0)]
     while stack:
-        directory, done, share = stack.pop()
-        state["path"], state["frac"] = directory, done
+        directory, done, share, depth = stack.pop()
+        state["path"], state["frac"], state["depth"] = directory, done, depth
         try:
             entries = list(os.scandir(directory))
         except OSError:
             continue
         state["dirs"] += 1
+        state["max_depth"] = max(state["max_depth"], depth)
         dirs, files = [], []
         for entry in entries:
             if not wanted(entry.name):
@@ -264,7 +266,7 @@ def walk(top):
         dirs.sort()
         step = share / len(dirs) if dirs else 0.0
         for i in reversed(range(len(dirs))):
-            stack.append((os.path.join(directory, dirs[i]), done + i * step, step))
+            stack.append((os.path.join(directory, dirs[i]), done + i * step, step, depth + 1))
 
 def found(row):
     global limit
@@ -317,7 +319,8 @@ except re.error as exc:
     emit({"error": "invalid pattern: %s" % exc})
 except SystemExit:
     pass
-emit({"done": {"dirs": state["dirs"], "files": state["files"], "seconds": time.time() - started}})
+emit({"done": {"dirs": state["dirs"], "files": state["files"], "max_depth": state["max_depth"],
+              "seconds": time.time() - started}})
 '''
 
 
@@ -475,14 +478,18 @@ class FileJob:
             return (name + " ERROR: " + self.error)[:width]
         frac = 1.0 if self.finished else (self.progress or {}).get("frac", 0.0)
         filled = int(frac * 20)
+        p = self.progress or {}
         head = "%s %s %3d%%  %5d found  %5.1fs  " % (
             name, "█" * filled + "·" * (20 - filled), 100 * frac, found, elapsed)
+        if not self.finished:
+            head += "depth %2d/%-2d  " % (p.get("depth", 0), p.get("max_depth", 0))
         if self.finished:
             d = self.done or {}
-            tail = "done: %d dirs, %d files" % (d.get("dirs", 0), d.get("files", 0))
+            tail = "done: %d dirs, %d files, depth %d" % (d.get("dirs", 0), d.get("files", 0),
+                                                          d.get("max_depth", 0))
         elif self.progress:
             stuck = time.time() - self.path_since
-            tail = self.progress["path"] + (" (%ds here)" % stuck if stuck >= 3 else "")
+            tail = p["path"] + (" (%ds here)" % stuck if stuck >= 3 else "")
         else:
             tail = "connecting…"
         room = width - len(head)
@@ -537,7 +544,8 @@ def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=Fa
     errors += [{"node": job.node["name"], "error": job.error} for job in jobs if job.error]
     stats = [{"node": job.node["name"], "found": len([r for r in job.rows if "error" not in r]),
               "seconds": (job.done or {}).get("seconds", time.time() - job.started),
-              "dirs": (job.done or {}).get("dirs"), "files": (job.done or {}).get("files")} for job in jobs]
+              "dirs": (job.done or {}).get("dirs"), "files": (job.done or {}).get("files"),
+              "max_depth": (job.done or {}).get("max_depth")} for job in jobs]
     return data, errors, skipped, stats
 
 
@@ -562,7 +570,8 @@ def render_file_results(operation, rows, errors, skipped, stats, as_json, verbos
         print("not searched: " + ", ".join(p["name"] for p in skipped), file=sys.stderr)
     if verbose:
         for s in sorted(stats, key=lambda s: s["node"]):
-            walked = "  %d dirs, %d files" % (s["dirs"], s["files"]) if s["dirs"] is not None else ""
+            walked = ("  %d dirs, %d files, depth %d" % (s["dirs"], s["files"], s["max_depth"])
+                      if s["dirs"] is not None else "")
             print("%-16s %5d found  %6.1fs%s" % (s["node"], s["found"], s["seconds"], walked), file=sys.stderr)
 
 

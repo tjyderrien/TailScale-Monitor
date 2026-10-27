@@ -98,13 +98,13 @@ limit output to 1,000 results, and only search online Linux peers. Use `--hidden
 
 Each host gets 300 seconds (`--timeout SEC`, `0` for no limit); a host that runs out of time keeps what
 it found so far, and the error says which path it was reading. `-v` prints a per-host summary (matches,
-time, directories and files walked) on stderr. `-vv` also shows a live progress bar per host with the
-path being searched, redrawn in place without scrolling. It costs a little extra traffic: each host
+time, directories and files walked, depth reached below the root) on stderr. `-vv` also shows a live
+progress bar per host with the current depth / deepest so far and the path being searched, redrawn in place without scrolling. It costs a little extra traffic: each host
 sends its position twice a second, only when it changed, which also shows where a slow disk is stuck:
 
 ```
-asus             ████████████████████ 100%    699 found    1.5s  done: 5366 dirs, 28871 files
-luzicka          ██████··············  31%  49954 found   56.7s  …/Bibliography/EPJ Applied Physics/1998
+asus             ████████████████████ 100%    699 found    1.5s  done: 5366 dirs, 28871 files, depth 9
+luzicka          ██████··············  31%  49954 found   56.7s  depth  4/11  …/Bibliography/EPJ Applied Physics/1998
 ```
 
 `mount` makes the whole tailnet look like one directory tree, so any local tool works on it:

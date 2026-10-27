@@ -187,7 +187,8 @@ means no limit. Default: 300.
 .TP
 .BR \-v ", " \-\-verbose
 Once: after the search, print one line per host on standard error with the number of matches,
-the time taken and the directories and files walked (also added as
+the time taken, the directories and files walked and the depth reached (the deepest directory level
+below the root, which is 0) (also added as
 .B stats
 to the
 .B \-\-json
@@ -195,7 +196,10 @@ output).
 Twice
 .RB ( \-vv ):
 while searching, also show one line per host on standard error, redrawn in place, with a progress
-bar, the number of matches, the elapsed time and the directory (for grep: the file) being read;
+bar, the number of matches, the elapsed time, the current depth and the deepest reached so far
+(e.g.
+.BR "depth 3/7" )
+and the directory (for grep: the file) being read;
 when the same path has been read for 3 seconds or more, its duration is shown, which points at slow
 disks or huge files. The bar is an estimate: each directory splits its parent's share evenly among
 its subdirectories. Each host then reports its position every 0.5 seconds when it changed, which costs some
