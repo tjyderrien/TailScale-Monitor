@@ -84,6 +84,7 @@ Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1
 ```sh
 ./tailmon.py search /var/log --name '*.log' # find matching files on every peer
 ./tailmon.py grep 'ERROR|WARN' /var/log -i  # grep file contents across the tailnet
+./tailmon.py search /media --name '*.pdf' -vv --timeout 0  # live progress, no time limit
 ./tailmon.py grep --fixed-strings 'needle' /home --hosts server-1 --json
 ./tailmon.py mount                          # every peer's / at /media/tailscale/<host>
 ./tailmon.py mount --path /data --hosts gpu-box,server-1
@@ -94,6 +95,17 @@ Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1
 limit output to 1,000 results, and only search online Linux peers. Use `--hidden`, `--max-results N`,
 `--hosts host1,host2`, and `--json` as needed. `grep` uses Python regular expressions; use
 `--fixed-strings` for literal text.
+
+Each host gets 300 seconds (`--timeout SEC`, `0` for no limit); a host that runs out of time keeps what
+it found so far, and the error says which path it was reading. `-v` prints a per-host summary (matches,
+time, directories and files walked) on stderr. `-vv` also shows a live progress bar per host with the
+path being searched, redrawn in place without scrolling. It costs a little extra traffic: each host
+sends its position twice a second, only when it changed, which also shows where a slow disk is stuck:
+
+```
+asus             ████████████████████ 100%    699 found    1.5s  done: 5366 dirs, 28871 files
+luzicka          ██████··············  31%  49954 found   56.7s  …/Bibliography/EPJ Applied Physics/1998
+```
 
 `mount` makes the whole tailnet look like one directory tree, so any local tool works on it:
 

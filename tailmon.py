@@ -204,7 +204,7 @@ while True:
 # File tools: a small stdlib-only worker streamed to each host over the existing SSH connection.
 # ---------------------------------------------------------------------------------------------
 FILE_TOOL = r'''
-import fnmatch, io, json, os, re, sys
+import fnmatch, io, json, os, re, sys, threading, time
 
 operation, root, pattern = sys.argv[1:4]
 root = os.path.expanduser(root)
@@ -212,38 +212,92 @@ limit = int(sys.argv[4])
 include_hidden = sys.argv[5] == "1"
 ignore_case = sys.argv[6] == "1"
 fixed = sys.argv[7] == "1"
+progress_every = float(sys.argv[8]) if len(sys.argv) > 8 else 0.0  # 0 = no progress reports
+started = time.time()
+lock = threading.Lock()
+# "frac" is the share of the tree already behind the walk: each directory splits its parent's share
+# evenly among its subdirectories. "path" is the directory (or, for grep, the file) being read.
+state = {"path": root, "frac": 0.0, "dirs": 0, "files": 0, "found": 0}
 
 def wanted(name):
     return include_hidden or not name.startswith(".")
 
 def emit(value):
-    print(json.dumps(value, ensure_ascii=True), flush=True)
+    line = json.dumps(value, ensure_ascii=True) + "\n"
+    with lock:  # the progress thread writes too: keep lines whole
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
+def heartbeat():
+    # Only sends when the position changed, so an idle or stuck walk costs nothing on the network;
+    # the local side times how long the walk has been on the same path.
+    last = None
+    while True:
+        time.sleep(progress_every)
+        now = (state["path"], round(state["frac"], 3))
+        if now != last:
+            last = now
+            emit({"progress": dict(state)})
+
+def walk(top):
+    # Depth-first like os.walk(topdown=True, followlinks=False), and also yields the share of the tree done.
+    stack = [(top, 0.0, 1.0)]
+    while stack:
+        directory, done, share = stack.pop()
+        state["path"], state["frac"] = directory, done
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        state["dirs"] += 1
+        dirs, files = [], []
+        for entry in entries:
+            if not wanted(entry.name):
+                continue
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            (dirs if is_dir else files).append(entry.name)
+        state["files"] += len(files)
+        yield directory, files
+        dirs.sort()
+        step = share / len(dirs) if dirs else 0.0
+        for i in reversed(range(len(dirs))):
+            stack.append((os.path.join(directory, dirs[i]), done + i * step, step))
+
+def found(row):
+    global limit
+    emit(row)
+    state["found"] += 1
+    limit -= 1
+    if limit <= 0:
+        raise SystemExit
+
+if progress_every > 0:
+    threading.Thread(target=heartbeat, daemon=True).start()
 try:
-    if operation == "search":
-        for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
-            dirs[:] = [d for d in dirs if wanted(d)]
+    if not os.path.isdir(root):
+        emit({"error": "no such directory: %s" % root})
+    elif operation == "search":
+        for directory, files in walk(root):
             for name in files:
-                if not wanted(name) or not fnmatch.fnmatch(name, pattern):
+                if not fnmatch.fnmatch(name, pattern):
                     continue
                 path = os.path.join(directory, name)
                 try:
-                    if os.path.isfile(path):
-                        emit({"path": path})
-                        limit -= 1
+                    is_file = os.path.isfile(path)
                 except OSError:
-                    pass
-                if limit <= 0:
-                    raise SystemExit
+                    continue
+                if is_file:
+                    found({"path": path})
     elif operation == "grep":
         flags = re.IGNORECASE if ignore_case else 0
         matcher = re.compile(re.escape(pattern) if fixed else pattern, flags)
-        for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
-            dirs[:] = [d for d in dirs if wanted(d)]
+        for directory, files in walk(root):
             for name in files:
-                if not wanted(name):
-                    continue
                 path = os.path.join(directory, name)
+                state["path"] = path
                 try:
                     raw = open(path, "rb")
                     if b"\x00" in raw.read(8192):
@@ -254,16 +308,16 @@ try:
                     try:
                         for number, line in enumerate(stream, 1):
                             if matcher.search(line):
-                                emit({"path": path, "line": number, "text": line.rstrip("\n\r")})
-                                limit -= 1
-                                if limit <= 0:
-                                    raise SystemExit
+                                found({"path": path, "line": number, "text": line.rstrip("\n\r")})
                     finally:
                         stream.close()
                 except (OSError, UnicodeError):
                     pass
 except re.error as exc:
     emit({"error": "invalid pattern: %s" % exc})
+except SystemExit:
+    pass
+emit({"done": {"dirs": state["dirs"], "files": state["files"], "seconds": time.time() - started}})
 '''
 
 
@@ -344,9 +398,13 @@ def collect(cfg, only=None):
     return results, skipped
 
 
-def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed):
+FILE_TIMEOUT = 300.0  # seconds per host for search/grep; big multi-disk trees need a while
+PROGRESS_SECONDS = 0.5  # how often a host reports its position with -vv (only when it changed)
+
+
+def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed, progress):
     args = ["-", operation, root, pattern, str(limit), "1" if hidden else "0",
-            "1" if ignore_case else "0", "1" if fixed else "0"]
+            "1" if ignore_case else "0", "1" if fixed else "0", str(PROGRESS_SECONDS if progress else 0)]
     if is_self:
         return [sys.executable] + args
     user = cfg["users"].get(node["name"], cfg["default_user"])
@@ -361,42 +419,134 @@ def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, i
     return ssh + [host] + [shlex.quote(value) for value in ["python3"] + args]
 
 
-def file_tool_on_host(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed):
-    try:
-        result = subprocess.run(
-            file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed),
-            input=FILE_TOOL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return [{"node": node["name"], "error": "timeout"}]
-    if result.returncode != 0:
-        err = (result.stderr.strip().splitlines() or ["exit %d" % result.returncode])[-1]
-        return [{"node": node["name"], "error": err[:160]}]
-    rows = []
-    for line in result.stdout.splitlines():
+class FileJob:
+    """One host's search/grep: results and progress as they stream in; partial results survive a timeout."""
+
+    def __init__(self, node):
+        self.node = node
+        self.rows, self.error, self.done, self.finished = [], None, None, False
+        self.progress, self.path_since = None, time.time()
+        self.started = time.time()
+
+    def run(self, cmd, timeout):
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, bufsize=1)
+        stderr = []
+        threading.Thread(target=lambda: stderr.extend(proc.stderr), daemon=True).start()
+        timer = threading.Timer(timeout, proc.kill) if timeout else None
+        if timer:
+            timer.start()
         try:
-            rows.append(dict(json.loads(line), node=node["name"]))
-        except ValueError:
-            continue
-    return rows
+            proc.stdin.write(FILE_TOOL)
+            proc.stdin.close()
+        except OSError:
+            pass  # the command already died; its error is on stderr
+        for line in proc.stdout:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if "progress" in row:
+                if not self.progress or row["progress"]["path"] != self.progress["path"]:
+                    self.path_since = time.time()
+                self.progress = row["progress"]
+            elif "done" in row:
+                self.done = row["done"]
+            else:
+                self.rows.append(dict(row, node=self.node["name"]))
+        code = proc.wait()
+        timed_out = timer is not None and not timer.is_alive() and self.done is None
+        if timer:
+            timer.cancel()
+        if timed_out:
+            where = " in %s" % self.progress["path"] if self.progress else ""
+            self.error = "timeout after %ds%s" % (timeout, where)
+        elif code != 0:
+            err = ("".join(stderr).strip().splitlines() or ["exit %d" % code])[-1]
+            self.error = err[:160]
+        self.finished = True
+
+    def status_line(self, width):
+        """One fixed-width line: name, progress bar, share done, matches, time, and the path being read."""
+        name = "%-16s" % self.node["name"][:16]
+        found = len([r for r in self.rows if "error" not in r])
+        elapsed = (self.done or {}).get("seconds") or time.time() - self.started
+        if self.finished and self.error:
+            return (name + " ERROR: " + self.error)[:width]
+        frac = 1.0 if self.finished else (self.progress or {}).get("frac", 0.0)
+        filled = int(frac * 20)
+        head = "%s %s %3d%%  %5d found  %5.1fs  " % (
+            name, "█" * filled + "·" * (20 - filled), 100 * frac, found, elapsed)
+        if self.finished:
+            d = self.done or {}
+            tail = "done: %d dirs, %d files" % (d.get("dirs", 0), d.get("files", 0))
+        elif self.progress:
+            stuck = time.time() - self.path_since
+            tail = self.progress["path"] + (" (%ds here)" % stuck if stuck >= 3 else "")
+        else:
+            tail = "connecting…"
+        room = width - len(head)
+        if len(tail) > room:
+            tail = "…" + tail[len(tail) - room + 1:] if room > 1 else ""
+        return head + tail
 
 
-def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=False, fixed=False):
+class ProgressBoard:
+    """A block of one line per host on stderr, redrawn in place (no scrolling) and erased at the end."""
+
+    def __init__(self, jobs):
+        self.jobs, self.drawn = jobs, 0
+
+    def draw(self):
+        width = shutil.get_terminal_size((120, 40)).columns - 1  # never wrap, or cursor-up would miss lines
+        lines = [j.status_line(width) for j in sorted(self.jobs, key=lambda j: j.node["name"])]
+        up = "\033[%dA" % self.drawn if self.drawn else ""
+        sys.stderr.write(up + "\r" + "".join("\033[K%s\n" % l for l in lines))
+        sys.stderr.flush()
+        self.drawn = len(lines)
+
+    def clear(self):
+        if self.drawn:
+            sys.stderr.write("\033[%dA\r\033[J" % self.drawn)
+            sys.stderr.flush()
+            self.drawn = 0
+
+
+def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=False, fixed=False,
+              verbose=0, timeout=0):
     targets, skipped = targets_for(cfg, only)
+    jobs = [FileJob(n) for n, _ in targets]
+    board = ProgressBoard(jobs) if verbose >= 2 and sys.stderr.isatty() else None
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
-        futs = [ex.submit(file_tool_on_host, n, cfg, is_self, operation, root, pattern,
-                          limit, hidden, ignore_case, fixed) for n, is_self in targets]
-        rows = [row for future in futs for row in future.result()]
+        futs = [ex.submit(job.run, file_tool_cmd(n, cfg, is_self, operation, root, pattern, limit, hidden,
+                                                 ignore_case, fixed, board is not None), timeout)
+                for job, (n, is_self) in zip(jobs, targets)]
+        try:
+            while board and not all(f.done() for f in futs):
+                board.draw()
+                cf.wait(futs, timeout=0.2)
+        finally:
+            if board:
+                board.clear()
+        for f in futs:
+            f.result()
+    rows = [row for job in jobs for row in job.rows]
     # A limit applies to the combined tailnet result, not independently to every host.
     data = [row for row in rows if "error" not in row][:limit]
     errors = [row for row in rows if "error" in row]
-    return data, errors, skipped
+    errors += [{"node": job.node["name"], "error": job.error} for job in jobs if job.error]
+    stats = [{"node": job.node["name"], "found": len([r for r in job.rows if "error" not in r]),
+              "seconds": (job.done or {}).get("seconds", time.time() - job.started),
+              "dirs": (job.done or {}).get("dirs"), "files": (job.done or {}).get("files")} for job in jobs]
+    return data, errors, skipped, stats
 
 
-def render_file_results(operation, rows, errors, skipped, as_json):
+def render_file_results(operation, rows, errors, skipped, stats, as_json, verbose=0):
     if as_json:
-        print(json.dumps({"results": rows, "errors": errors,
-                          "skipped": [p["name"] for p in skipped]}, indent=2))
+        out = {"results": rows, "errors": errors, "skipped": [p["name"] for p in skipped]}
+        if verbose:
+            out["stats"] = stats
+        print(json.dumps(out, indent=2))
         return
     if rows:
         for row in rows:
@@ -410,6 +560,10 @@ def render_file_results(operation, rows, errors, skipped, as_json):
         print("%s: ERROR: %s" % (row["node"], row["error"]), file=sys.stderr)
     if skipped:
         print("not searched: " + ", ".join(p["name"] for p in skipped), file=sys.stderr)
+    if verbose:
+        for s in sorted(stats, key=lambda s: s["node"]):
+            walked = "  %d dirs, %d files" % (s["dirs"], s["files"]) if s["dirs"] is not None else ""
+            print("%-16s %5d found  %6.1fs%s" % (s["node"], s["found"], s["seconds"], walked), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -818,6 +972,12 @@ def file_main(argv):
                             help="maximum results across all hosts")
         parser.add_argument("--hidden", action="store_true", help="include hidden files and directories")
         parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+        parser.add_argument("--timeout", type=float, default=FILE_TIMEOUT, metavar="SEC",
+                            help="give up on a host after SEC seconds, keeping what it found "
+                                 "(default %(default)g, 0: no limit)")
+        parser.add_argument("-v", "--verbose", action="count", default=0,
+                            help="-v: per-host summary; -vv: also a live progress bar per host with "
+                                 "the path being searched (extra network traffic)")
 
     search = sub.add_parser("search", help="find files by name")
     common(search)
@@ -839,11 +999,12 @@ def file_main(argv):
     cfg = load_config()
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
     pattern = a.name if a.operation == "search" else a.pattern
-    rows, errors, skipped = file_tool(cfg, only, a.operation, a.path, pattern,
-                                       a.max_results, a.hidden,
-                                       getattr(a, "ignore_case", False),
-                                       getattr(a, "fixed_strings", False))
-    render_file_results(a.operation, rows, errors, skipped, a.json)
+    rows, errors, skipped, stats = file_tool(cfg, only, a.operation, a.path, pattern,
+                                              a.max_results, a.hidden,
+                                              getattr(a, "ignore_case", False),
+                                              getattr(a, "fixed_strings", False),
+                                              a.verbose, a.timeout)
+    render_file_results(a.operation, rows, errors, skipped, stats, a.json, a.verbose)
 
 
 def main():

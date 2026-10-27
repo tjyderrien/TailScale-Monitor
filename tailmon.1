@@ -21,6 +21,9 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-max\-results
 .IR N ]
 .RB [ \-\-hidden ]
+.RB [ \-\-timeout
+.IR SEC ]
+.RB [ \-v | \-vv ]
 .RB [ \-\-json ]
 .br
 .B tailmon grep
@@ -33,6 +36,9 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-max\-results
 .IR N ]
 .RB [ \-\-hidden ]
+.RB [ \-\-timeout
+.IR SEC ]
+.RB [ \-v | \-vv ]
 .RB [ \-\-json ]
 .br
 .B tailmon mount
@@ -169,9 +175,34 @@ Include files and directories whose name starts with a dot (skipped by default).
 Print
 .B {"results": [...], "errors": [...], "skipped": [...]}
 instead of text.
+.TP
+.BI \-\-timeout " SEC"
+Give up on a host after
+.I SEC
+seconds; what it found until then is kept, and the error names the path it was reading
+(with
+.BR \-vv ).
+.B 0
+means no limit. Default: 300.
+.TP
+.BR \-v ", " \-\-verbose
+Once: after the search, print one line per host on standard error with the number of matches,
+the time taken and the directories and files walked (also added as
+.B stats
+to the
+.B \-\-json
+output).
+Twice
+.RB ( \-vv ):
+while searching, also show one line per host on standard error, redrawn in place, with a progress
+bar, the number of matches, the elapsed time and the directory (for grep: the file) being read;
+when the same path has been read for 3 seconds or more, its duration is shown, which points at slow
+disks or huge files. The bar is an estimate: each directory splits its parent's share evenly among
+its subdirectories. Each host then reports its position every 0.5 seconds when it changed, which costs some
+network traffic. The display is only drawn when standard error is a terminal; the board is erased
+before the results are printed.
 .PP
 Per\-host errors and the list of hosts that were not searched are written to standard error.
-Each host has 60 seconds to answer.
 .SS "mount"
 Mount each online Linux peer with
 .BR sshfs (1)
