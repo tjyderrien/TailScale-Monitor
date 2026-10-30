@@ -332,11 +332,13 @@ Start an unattended Claude Code agent
 .RB ( "claude \-p" ,
 detached) for every open Todoist task labelled
 .BR @claude ,
-with the task title and description as the request. Another label naming a Tailscale host picks the
+with the task title and description as the request. Words such as
+.B @claude
+typed in the title count as labels. Another label naming a Tailscale host picks the
 machine (default: this one); a description line
 .B dir:
-.I path
-picks the folder (default: home). The agent may read and edit files but has no shell
+.IR path ,
+or a description that starts with a path, picks the folder (created if missing; default: home). The agent may read and edit files but has no shell
 .RB ( "\-\-permission\-mode acceptEdits \-\-disallowedTools Bash" ).
 The label becomes
 .B @claude\-running
@@ -345,7 +347,11 @@ stopped is posted as a comment, with the command to resume its session, and the 
 .B @claude\-done
 or
 .BR @claude\-failed .
-Closing the task is left to you. At most
+Closing the task is left to you; to run it again, remove the
+.B @claude\-done
+or
+.B @claude\-failed
+label. At most
 .B dispatch_max
 agents run at once.
 .TP

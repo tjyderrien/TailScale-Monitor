@@ -200,9 +200,12 @@ timer.
 Give a Todoist task the label `@claude` and run `tailmon dispatch` (by hand, or every few minutes from cron).
 It starts `claude -p` on a host, detached, with the task title and description as the request:
 
+- **Labels:** real Todoist labels or `@words` typed in the title (`@claude @asus Fix the plots`) both count,
+  in any case.
 - **Where:** a second label naming a Tailscale host (`@asus`) picks the machine, otherwise the local one. A
-  line `dir: ~/Documents/project` in the description picks the folder, otherwise the home directory. The
-  host needs Claude Code installed and logged in.
+  line `dir: ~/Documents/project` in the description, or a description that starts with a path, picks the
+  folder (created if missing), otherwise the home directory. The host needs Claude Code installed and
+  logged in.
 - **What it may do:** read and edit files (`--permission-mode acceptEdits`). It has no shell
   (`--disallowedTools Bash`): when the task needs a command or a decision, it says so in its report.
 - **While it runs:** the label becomes `@claude-running`, and a comment gives the host, folder and session ID.
@@ -211,7 +214,7 @@ It starts `claude -p` on a host, detached, with the task title and description a
   the session, and sets the label to `@claude-done` (or `@claude-failed`). You read it and close the task.
 
 At most `dispatch_max` agents run at once (default 3); the others wait for the next run. To run a task
-again, put `@claude` back on it.
+again, remove its `@claude-done` or `@claude-failed` label.
 
 ## Configuration
 

@@ -1205,11 +1205,11 @@ if op == "start":
     # Non-interactive ssh shells often lack ~/.local/bin on the PATH.
     extra = [os.path.expanduser(p) for p in ("~/.local/bin", "~/.claude/local", "~/.npm-global/bin")]
     claude = shutil.which("claude", path=os.pathsep.join([os.environ.get("PATH", "")] + extra))
+    created = not os.path.isdir(folder)
     if not claude:
         emit({"error": "claude not found on this host"})
-    elif not os.path.isdir(folder):
-        emit({"error": "no such folder: %s" % folder})
     else:
+        os.makedirs(folder, exist_ok=True)  # the task may be to start something new there
         os.makedirs(RUN, exist_ok=True)
         with open(out_path, "w") as out:
             p = subprocess.Popen([claude, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
@@ -1217,7 +1217,7 @@ if op == "start":
                                   "--append-system-prompt", NOTE],
                                  cwd=folder, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  start_new_session=True)  # survives the ssh session
-        emit({"pid": p.pid})
+        emit({"pid": p.pid, "created": created})
 elif op == "check":
     try:
         with open("/proc/%s/cmdline" % sys.argv[3], "rb") as f:
@@ -1267,7 +1267,8 @@ def launcher(node, cfg, is_self, args):
 def relabel(token, task_id, drop, add):
     task = todoist(token, "GET", "/tasks/" + task_id)
     if task:
-        labels = [l for l in task.get("labels", []) if l not in drop]
+        drop = {d.lower() for d in drop}
+        labels = [l for l in task.get("labels", []) if l.lower() not in drop]
         todoist(token, "POST", "/tasks/" + task_id, {"labels": labels + [add]})
 
 
@@ -1338,41 +1339,59 @@ def dispatch_main(argv):
             save()
 
         # New @claude tasks: start an agent on the host named by another label, else here.
-        for task in todoist_all(token, "/tasks"):
-            if label not in task.get("labels", []) or task["id"] in state["running"]:
+        # "@word" in the title counts as a label too, as Todoist leaves it as text for unknown labels.
+        tasks = todoist_all(token, "/tasks")
+        tag_re = re.compile(r"(?<!\S)@([\w.-]+)")
+        lowered = label.lower()
+        finished = {lowered + "-running", lowered + "-done", lowered + "-failed"}
+
+        def tags(t):
+            return [l.lower() for l in t.get("labels", [])] + [m.lower() for m in tag_re.findall(t["content"])]
+        wanted = [t for t in tasks if lowered in tags(t) and not finished & set(tags(t))]
+        if not wanted:
+            seen = sorted({l for t in tasks for l in tags(t)})
+            print("no open task labelled @%s among %d open tasks (labels seen: %s)" % (
+                label, len(tasks), ", ".join("@" + l for l in seen) or "none"))
+        for task in wanted:
+            if task["id"] in state["running"]:
                 continue
-            hosts = [l.lower() for l in task["labels"] if l.lower() in nodes]
+            hosts = [l for l in tags(task) if l in nodes]
             name = hosts[0] if hosts else me
+            title = tag_re.sub(lambda m: "" if m.group(1).lower() in nodes or m.group(1).lower() == lowered
+                               else m.group(0), task["content"])
+            title = re.sub(r"\s+", " ", title).strip()
             folder = "~"
             lines = []
             for line in (task.get("description") or "").splitlines():
-                m = re.match(r"\s*dir:\s*(.+?)\s*$", line, re.I)
-                if m:
+                m = re.match(r"\s*dir:\s*(.+?)\s*$", line, re.I) or (
+                    re.match(r"\s*([~/]\S*)\s*$", line) if not lines and folder == "~" else None)
+                if m:  # "dir: path", or a description that starts with a bare path
                     folder = m.group(1)
-                else:
+                elif line.strip() or lines:
                     lines.append(line)
             if len(state["running"]) >= cfg["dispatch_max"]:
                 print("waiting  %s (already %d agents running)" % (task["content"], cfg["dispatch_max"]))
                 continue
             if a.dry_run:
-                print("would start  [%s] %s: %s" % (name, folder, task["content"]))
+                print("would start  [%s] %s: %s" % (name, folder, title))
                 continue
             sid = str(uuid.uuid4())
-            prompt = "\n\n".join(x for x in [task["content"], "\n".join(lines).strip()] if x)
+            prompt = "\n\n".join(x for x in [title, "\n".join(lines).strip()] if x)
             n, is_self = nodes[name]
             started = launcher(n, cfg, is_self, ["start", sid, folder,
-                                                 base64.b64encode(("todo: " + task["content"])[:80].encode()).decode(),
+                                                 base64.b64encode(("todo: " + title)[:80].encode()).decode(),
                                                  base64.b64encode(prompt.encode()).decode()])
             if "error" in started:
                 print("%s: ERROR: %s (%s)" % (n["name"], started["error"], task["content"]), file=sys.stderr)
                 continue
             state["running"][task["id"]] = {"node": n["name"], "sid": sid, "pid": started["pid"], "dir": folder,
-                                            "content": task["content"], "started": time.strftime("%m-%d %H:%M")}
+                                            "content": title, "started": time.strftime("%m-%d %H:%M")}
             save()
             todoist(token, "POST", "/comments", {"task_id": task["id"], "content":
-                    "Agent started on %s in %s (session %s)." % (n["name"], folder, sid)})
+                    "Agent started on %s in %s%s (session %s)." % (
+                        n["name"], folder, " (folder created)" if started.get("created") else "", sid)})
             relabel(token, task["id"], (label,), label + "-running")
-            print("started  [%s] %s: %s" % (n["name"], folder, task["content"]))
+            print("started  [%s] %s: %s" % (n["name"], folder, title))
     except TodoistError as exc:
         sys.exit("tailmon: Todoist: %s" % exc)
     print("%d agent(s) running" % len(state["running"]))
