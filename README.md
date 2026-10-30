@@ -27,6 +27,8 @@ server-1         64 cores  load 0.10 0.07 0.07
 - **Tailnet mounts.** `mount` puts every online Linux peer's filesystem under `/media/tailscale/<host>` with
   `sshfs`, so ordinary programs (image viewers, scripts, …) can open files from all machines at once,
   with the same path layout on every host.
+- **Claude Code sessions.** `claude` lists the [Claude Code](https://claude.com/claude-code) sessions on every
+  host and groups the unfinished ones by what you have to do to finish them.
 
 ## Requirements
 
@@ -125,6 +127,34 @@ network drops; running `mount` again only fills in missing or stale ones. `umoun
 Mounts don't survive a reboot: run `tailmon mount` again (e.g. from your session startup).
 Don't run it with `sudo`: it must use your own SSH keys and user.
 
+### Claude Code sessions
+
+```sh
+./tailmon.py claude                         # open sessions of the last 60 days, grouped by what to do
+./tailmon.py claude --by host               # one table per machine
+./tailmon.py claude --by state              # grouped by session state
+./tailmon.py claude --all --days 14         # include finished sessions, last 14 days
+./tailmon.py claude --markdown report.md    # also write the report as Markdown
+./tailmon.py claude --json                  # raw session data
+```
+
+Each host's `~/.claude` is read over the same SSH connection as the other commands, and the sessions are
+sorted into:
+
+| Group                             | Meaning                                                                         |
+|-----------------------------------|---------------------------------------------------------------------------------|
+| Run a command yourself            | The session asked you to run something (often `sudo` or `ssh-add`). The command is shown. |
+| Commit / push git                 | Work is finished but the folder has uncommitted changes or unpushed commits.    |
+| Answer the session                | The session ended on a question.                                                |
+| Restart the task in a new session | Cut off by a usage limit, stopped mid-task, or promised to report back and never did. The last request is shown. |
+| Running, just wait                | The session is working right now.                                               |
+| Idle, can be closed               | The session is still open but has nothing pending.                              |
+| Done                              | Shown only with `--all`.                                                        |
+
+To pick a session back up, go to its folder on that machine and run `claude --resume`. Grouping relies on
+keywords in each session's last reply, so a few sessions land in the wrong group. When a task was resumed in
+several sessions, only the most recent is shown.
+
 ## Configuration
 
 Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in default:
@@ -135,6 +165,7 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
   "default_user": "admin",
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer-pi"],
+  "claude_exclude": ["Downloads"],
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -146,6 +177,7 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `default_user`     | SSH user for hosts not listed in `users` (default `null`: your `~/.ssh/config` / local username) |
 | `identity`         | SSH private key passed with `-i` (default `null`: your usual SSH keys / agent)           |
 | `exclude`          | Tailscale hostnames never to probe                                                       |
+| `claude_exclude`   | For `claude`: regular expressions; sessions whose folder or first request matches are hidden |
 | `sample_seconds`   | Measurement window for rates (CPU %, disk / network throughput) in snapshot mode         |
 | `discover_seconds` | In watch mode, how often to re-run `tailscale status` to find new or departed hosts      |
 

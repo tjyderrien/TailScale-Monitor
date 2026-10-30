@@ -11,12 +11,15 @@ the local machine is probed directly.
     tailmon.py --json             machine-readable snapshot
     tailmon.py --hosts web-1,db-1
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
+    tailmon.py claude             Claude Code sessions on every host, grouped by how to finish them
 """
 import argparse
+import calendar
 import concurrent.futures as cf
 import json
 import shlex
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +35,8 @@ DEFAULT_CONFIG = {
     # SSH private key passed with -i; null: ssh's usual keys / agent.
     "identity": None,
     "exclude": [],
+    # `tailmon claude`: regexes on a session's folder or first request; matching sessions are hidden.
+    "claude_exclude": [],
     "sample_seconds": 1.0,
     # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
     "discover_seconds": 30.0,
@@ -576,6 +581,395 @@ def render_file_results(operation, rows, errors, skipped, stats, as_json, verbos
 
 
 # ---------------------------------------------------------------------------------------------
+# Claude Code sessions: a stdlib-only worker summarizes ~/.claude on each host; triage happens here.
+# ---------------------------------------------------------------------------------------------
+CLAUDE_AGENT = r'''
+import glob, json, os, re, subprocess, sys, time
+
+DAYS = float(sys.argv[1])
+HOME = os.path.expanduser("~")
+NOISE = ("<command", "<local-command", "<system", "<bash-", "<task-notification",
+         "[Request interrupted", "Caveat:", "This session is being continued")
+
+def text_of(row):
+    content = (row.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content, False, False
+    parts, has_tool_use, has_tool_result = [], False, False
+    for block in content or []:
+        kind = block.get("type")
+        if kind == "text":
+            parts.append(block.get("text", ""))
+        elif kind == "tool_use":
+            has_tool_use = True
+        elif kind == "tool_result":
+            has_tool_result = True
+    return "\n".join(parts), has_tool_use, has_tool_result
+
+def live_sessions():
+    """Session id -> registry entry, for processes that are still alive."""
+    live = {}
+    for path in glob.glob(os.path.join(HOME, ".claude/sessions/*.json")):
+        try:
+            with open(path) as f:
+                entry = json.load(f)
+            os.kill(int(entry["pid"]), 0)
+        except (OSError, ValueError, KeyError):
+            continue
+        live[entry.get("sessionId")] = entry
+    return live
+
+_git_cache = {}
+
+def git_state(cwd):
+    if cwd in _git_cache:
+        return _git_cache[cwd]
+    state = None
+    if cwd and os.path.isdir(cwd) and os.path.realpath(cwd) != os.path.realpath(HOME):
+        try:
+            out = subprocess.run(["git", "-C", cwd, "status", "-sb", "--porcelain"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, universal_newlines=True, timeout=20)
+            if out.returncode == 0:
+                lines = out.stdout.splitlines()
+                branch = lines[0][3:] if lines else ""
+                ahead = re.search(r"(?:ahead|devant) (\d+)", branch)
+                state = {"branch": branch.split("...")[0], "dirty": len(lines) - 1,
+                         "ahead": int(ahead.group(1)) if ahead else 0, "upstream": "..." in branch}
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _git_cache[cwd] = state
+    return state
+
+def summarize(path, live):
+    prompts, last_reply, title, cwd = [], "", "", ""
+    first_ts = last_ts = ""
+    last_kind = None  # "reply", "tool_use", "tool_result", "prompt"
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("type") == "summary":
+                title = row.get("summary") or title
+            title = row.get("customTitle") or row.get("aiTitle") or title
+            if row.get("type") not in ("user", "assistant") or row.get("isSidechain"):
+                continue
+            cwd = row.get("cwd") or cwd
+            if row.get("timestamp"):
+                first_ts = first_ts or row["timestamp"]
+                last_ts = row["timestamp"]
+            text, tool_use, tool_result = text_of(row)
+            text = text.strip()
+            if row["type"] == "user":
+                if tool_result:
+                    last_kind = "tool_result"
+                elif text and not row.get("isMeta") and not text.startswith(NOISE):
+                    prompts.append(re.sub(r"\s+", " ", text))
+                    last_kind = "prompt"
+            else:
+                if text:
+                    last_reply, last_kind = text, "reply"
+                if tool_use:
+                    last_kind = "tool_use"
+    if not prompts:
+        return None
+    sid = os.path.basename(path)[:-6]
+    entry = live.get(sid)
+    return {
+        "id": sid, "path": path, "cwd": cwd, "title": title,
+        "start": first_ts, "end": last_ts or time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(os.path.getmtime(path))),
+        "prompts": len(prompts), "first_prompt": prompts[0][:400],
+        "last_prompt": prompts[-1][:400], "last_reply": last_reply[-1500:], "last_kind": last_kind,
+        "live": {"pid": entry["pid"], "status": entry.get("status"), "name": entry.get("name"),
+                 "kind": entry.get("kind")} if entry else None,
+        "git": git_state(cwd),
+    }
+
+live = live_sessions()
+cutoff = time.time() - DAYS * 86400
+sessions = []
+for path in glob.glob(os.path.join(HOME, ".claude/projects/*/*.jsonl")):
+    try:
+        if os.path.getmtime(path) < cutoff:
+            continue
+        summary = summarize(path, live)
+    except OSError:
+        continue
+    if summary:
+        sessions.append(summary)
+json.dump({"home": HOME, "sessions": sessions}, sys.stdout)
+'''
+
+# Session state, in report order; the first matching rule in classify() wins.
+CLAUDE_STATES = [
+    ("RUNNING", "Running now"),
+    ("INPUT", "Needs your input"),
+    ("LIMIT", "Cut off by usage limit"),
+    ("INTERRUPTED", "Stopped mid-task"),
+    ("UNFINISHED", "Announced more work, never reported back"),
+    ("GIT", "Done, but git work not committed/pushed"),
+    ("OPEN", "Idle session still open"),
+    ("DONE", "Done"),
+]
+# How to finish a session, in report order (quickest first).
+CLAUDE_METHODS = [
+    ("COMMAND", "Run a command yourself"),
+    ("GIT", "Commit / push git"),
+    ("ANSWER", "Answer the session"),
+    ("RESTART", "Restart the task in a new session"),
+    ("WAIT", "Running, just wait"),
+    ("CLOSE", "Idle, can be closed"),
+    ("DONE", "Done"),
+]
+LIMIT_RE = re.compile(r"hit your (session|usage) limit|usage limit", re.I)
+ASK_RE = re.compile(
+    r"\?\s*$|\b(want me to|do you want|would you like|shall I|tell me (which|if|when)|"
+    r"let me know|or say which|which do you prefer|can you run|run it yourself|"
+    r"voulez-vous|veux-tu|tu veux|pouvez-vous|peux-tu)\b", re.I)
+BYE_RE = re.compile(r"^\W*(thanks|thank you|merci|ok|okay)?\W*(good ?bye|bye|à plus|ciao)?\W*$", re.I)
+PROMISE_RE = re.compile(
+    r"\b(I'll report back|I will report|next I'll|now I'm|I'm checking|still running|"
+    r"running in the background|when it finishes|once it finishes|I'll wait|waiting for|"
+    r"en cours|je reviens)\b", re.I)
+CMD_RE = re.compile(r"(^|\n)\s*`*! \S|run (it|this|these|them) yourself|in your own terminal|"
+                    r"you need to run|dans votre propre terminal|lance[rz]? (cette|la) commande", re.I)
+
+
+def claude_cmd(node, cfg, is_self, days):
+    args = ["-", str(days)]
+    if is_self:
+        return [sys.executable, "-I"] + args
+    user = cfg["users"].get(node["name"], cfg["default_user"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=5",
+           "-o", "ServerAliveCountMax=3"]
+    if cfg.get("identity"):
+        ssh += ["-i", os.path.expanduser(cfg["identity"])]
+    ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
+    host = "%s@%s" % (user, node["name"]) if user else node["name"]
+    return ssh + [host, "python3", "-I"] + args
+
+
+def claude_on_host(node, cfg, is_self, days):
+    try:
+        r = subprocess.run(claude_cmd(node, cfg, is_self, days), input=CLAUDE_AGENT, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return {"node": node["name"], "error": "timeout"}
+    if r.returncode != 0:
+        err = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+        return {"node": node["name"], "error": err[:160]}
+    try:
+        return dict(json.loads(r.stdout), node=node["name"])
+    except ValueError:
+        return {"node": node["name"], "error": "unreadable output"}
+
+
+def claude_classify(s):
+    live, git = s.get("live"), s.get("git") or {}
+    reply = s["last_reply"]
+    if live and live.get("status") == "busy":
+        return "RUNNING"
+    if LIMIT_RE.search(reply[-300:]):
+        return "LIMIT"
+    if s["last_kind"] == "prompt" and BYE_RE.search(s["last_prompt"]):
+        return "DONE"
+    if s["last_kind"] in ("tool_use", "tool_result", "prompt") and not live:
+        return "INTERRUPTED"
+    tail = reply[-600:]
+    if ASK_RE.search(tail):
+        return "INPUT"
+    if PROMISE_RE.search(tail):
+        return "UNFINISHED"
+    if git.get("ahead") or git.get("dirty"):
+        return "GIT"
+    return "OPEN" if live else "DONE"
+
+
+def claude_method(s):
+    state, live = s["state"], s.get("live")
+    if state == "RUNNING":
+        return "WAIT"
+    if state in ("LIMIT", "INTERRUPTED", "UNFINISHED"):
+        return "ANSWER" if live else "RESTART"
+    if state == "INPUT":
+        return "COMMAND" if CMD_RE.search(s["last_reply"][-1500:].replace("*", "")) else "ANSWER"
+    if state == "GIT":
+        return "GIT"
+    return "CLOSE" if state == "OPEN" else "DONE"
+
+
+def claude_dedupe(sessions):
+    """Resumed/forked sessions repeat the same first prompt; keep the most recent."""
+    groups = {}
+    for s in sessions:
+        groups.setdefault((s["node"], s["first_prompt"][:200]), []).append(s)
+    kept = []
+    for group in groups.values():
+        latest = max(group, key=lambda s: s["end"])
+        latest["live"] = latest.get("live") or next((s["live"] for s in group if s.get("live")), None)
+        kept.append(latest)
+    return kept
+
+
+def one_line(text, limit):
+    text = re.sub(r"\s+", " ", re.sub(r"[*`#|]", "", text)).strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def ago(ts):
+    try:
+        then = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))  # session timestamps are UTC
+    except ValueError:
+        return "?"
+    days = (time.time() - then) / 86400
+    return "%dh" % (days * 24) if days < 1 else "%dd" % days
+
+
+def gist(s):
+    """The part of the last reply that says what is pending."""
+    sentences = re.split(r"(?<=[.?!:])\s+", re.sub(r"\s+", " ", s["last_reply"]).strip())
+    if s["state"] == "INPUT":
+        asks = [x for x in sentences if ASK_RE.search(x)]
+        return asks[-1] if asks else sentences[-1]
+    if s["state"] in ("LIMIT", "INTERRUPTED"):
+        return "Last request: " + s["last_prompt"]
+    return " ".join(sentences[-2:])
+
+
+def git_note(git):
+    bits = []
+    if git.get("ahead"):
+        bits.append("%d commit(s) not pushed" % git["ahead"])
+    if git.get("dirty"):
+        bits.append("%d uncommitted change(s)" % git["dirty"])
+    if not git.get("upstream"):
+        bits.append("no upstream")
+    return "git %s: %s" % (git["branch"], ", ".join(bits))
+
+
+def command_in(reply):
+    """First shell command suggested in a reply (a `! cmd` line or a code block line)."""
+    for line in reply.splitlines():
+        line = line.strip().strip("`")
+        if line.startswith("! "):
+            return line[2:]
+    for block in reversed(re.findall(r"```[a-z]*\n(.*?)```", reply, re.S)):
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        if lines:
+            return lines[0]
+    return ""
+
+
+def next_step(s):
+    how = s["method"]
+    if how == "COMMAND":
+        cmd = command_in(s["last_reply"])
+        return ("$ " + cmd) if cmd else gist(s)
+    if how == "GIT":
+        return git_note(s.get("git") or {}).split(": ", 1)[-1]
+    if how == "RESTART":
+        return ("[%s] " % s["state"].lower()) + s["last_prompt"]
+    if how in ("CLOSE", "DONE"):
+        return s["title"] or s["first_prompt"]
+    return gist(s)
+
+
+def project(s):
+    if os.path.realpath(s["cwd"] or s["home"]) == os.path.realpath(s["home"]):
+        return "~ " + (s["title"] or s["first_prompt"])
+    return os.path.basename(s["cwd"].rstrip("/"))
+
+
+def render_claude(sessions, show_all, by, markdown=False):
+    if by == "host":
+        groups = [(h, h) for h in sorted({s["node"] for s in sessions})]
+        key_of = "node"
+    else:
+        groups, key_of = (CLAUDE_STATES, "state") if by == "state" else (CLAUDE_METHODS, "method")
+    seen, unique = set(), []
+    for s in sorted(sessions, key=lambda s: s["end"], reverse=True):
+        if not show_all and s["method"] == "DONE":
+            continue
+        key = (s["node"], s["cwd"]) if s["method"] == "GIT" else s["id"]
+        if key not in seen:  # one git row per folder
+            seen.add(key)
+            unique.append(s)
+    rows = {s["id"]: [s["node"], project(s), ago(s["end"]), next_step(s)] for s in unique}
+    head = ["Host", "Project", "Last", "Next step"]
+    w = [min(cap, max([len(head[i])] + [len(r[i]) for r in rows.values()])) for i, cap in enumerate([16, 28, 4])]
+    rest = max(30, shutil.get_terminal_size((140, 24)).columns - sum(w) - 8)
+    fmt = "  %-{}s  %-{}s  %-{}s  %s".format(*w)
+    order = [m for m, _ in CLAUDE_METHODS]
+    lines = []
+    for key, label in groups:
+        group = [s for s in unique if s[key_of] == key]
+        if not group:
+            continue
+        group.sort(key=lambda s: (order.index(s["method"]), s["end"]) if by == "host" else (s["node"], s["end"]))
+        title = "%s (%d)" % (label, len(group))
+        if markdown:
+            lines += ["", "## " + title, "", "| " + " | ".join(head) + " |", "|---|---|---|---|"]
+            lines += ["| " + " | ".join(one_line(x, 300).replace("|", "/") for x in rows[s["id"]]) + " |"
+                      for s in group]
+        else:
+            lines += ["", title, fmt % tuple(head),
+                      fmt % tuple("-" * n for n in w + [min(rest, 40)])]
+            for s in group:
+                r = rows[s["id"]]
+                lines.append(fmt % (one_line(r[0], w[0]), one_line(r[1], w[1]), r[2], one_line(r[3], rest)))
+    return "\n".join(lines)
+
+
+def claude_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon claude",
+                                 description="List the Claude Code sessions on every host and group them "
+                                             "by how to finish them")
+    ap.add_argument("--days", type=float, default=60, help="look back this many days (default %(default)g)")
+    ap.add_argument("--hosts", help="comma-separated Tailscale hostnames")
+    ap.add_argument("--all", action="store_true", help="also list finished sessions")
+    ap.add_argument("--by", choices=["method", "state", "host"], default="method",
+                    help="group by how to finish it (default), session state, or host")
+    ap.add_argument("--markdown", metavar="FILE", help="also write the report as Markdown to FILE")
+    ap.add_argument("--json", action="store_true", help="print the raw session data as JSON")
+    a = ap.parse_args(argv[1:])
+    cfg = load_config()
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    targets, skipped = targets_for(cfg, only)
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(lambda t: claude_on_host(t[0], cfg, t[1], a.days), targets))
+
+    exclude = [re.compile(p, re.I) for p in cfg["claude_exclude"]]
+    sessions, errors = [], [r for r in results if "error" in r]
+    for data in results:
+        for s in data.get("sessions", []):
+            if not any(p.search(s["cwd"]) or p.search(s["first_prompt"]) for p in exclude):
+                sessions.append(dict(s, node=data["node"], home=data["home"]))
+    sessions = claude_dedupe(sessions)
+    for s in sessions:
+        s["state"] = claude_classify(s)
+        s["method"] = claude_method(s)
+
+    if a.json:
+        print(json.dumps({"sessions": sessions, "errors": errors,
+                          "skipped": [p["name"] for p in skipped]}, indent=1))
+    else:
+        print("Claude sessions on %s (last %g days)" % (", ".join(n["name"] for n, _ in targets) or "no host",
+                                                            a.days))
+        print(render_claude(sessions, a.all, a.by) or "\nnothing pending")
+    if a.markdown:
+        with open(os.path.expanduser(a.markdown), "w") as f:
+            f.write("# Claude sessions — %s\n" % time.strftime("%Y-%m-%d %H:%M"))
+            f.write(render_claude(sessions, a.all, a.by, markdown=True) + "\n")
+    for r in errors:
+        print("%s: ERROR: %s" % (r["node"], r["error"]), file=sys.stderr)
+    if skipped:
+        print("not checked: " + ", ".join(
+            "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------
 # Mounts: each peer's filesystem under one local directory via sshfs (FUSE, no root needed).
 # ---------------------------------------------------------------------------------------------
 MOUNT_ROOT = "/media/tailscale"
@@ -1021,6 +1415,8 @@ def main():
         return file_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in ("mount", "umount"):
         return mount_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "claude":
+        return claude_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")

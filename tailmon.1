@@ -56,6 +56,18 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-hosts
 .IR LIST ]
 .RB [ \-\-json ]
+.br
+.B tailmon claude
+.RB [ \-\-days
+.IR N ]
+.RB [ \-\-all ]
+.RB [ \-\-by
+.IR method | state | host ]
+.RB [ \-\-markdown
+.IR FILE ]
+.RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-json ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -242,6 +254,37 @@ Only these comma\-separated Tailscale hostnames.
 Print
 .B {"results": [...], "skipped": [...]}
 instead of text.
+.SS "claude"
+List the Claude Code sessions found in
+.I ~/.claude
+on every online Linux peer and the local machine, and group the unfinished ones by how to finish them:
+run a command yourself, commit or push git, answer the session, restart the task in a new session,
+wait for a running session, or close an idle one. Grouping relies on keywords in each session\(aqs last
+reply. When a task was resumed in several sessions, only the most recent is shown. Each host has
+180 seconds to answer.
+.TP
+.BI \-\-days " N"
+Only sessions active in the last
+.I N
+days. Default 60.
+.TP
+.B \-\-all
+Also list finished sessions.
+.TP
+.BI \-\-by " method\fR|\fPstate\fR|\fPhost"
+Group by how to finish the session (default), by session state, or by host.
+.TP
+.BI \-\-markdown " FILE"
+Also write the report as Markdown to
+.IR FILE .
+.TP
+.BI \-\-hosts " LIST"
+Only these comma\-separated Tailscale hostnames.
+.TP
+.B \-\-json
+Print
+.B {"sessions": [...], "errors": [...], "skipped": [...]}
+instead of the report.
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -301,6 +344,7 @@ overrides any of the built\-in defaults:
   "default_user": "admin",
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer\-pi"],
+  "claude_exclude": ["Downloads"],
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -328,6 +372,11 @@ your usual keys or agent.
 .TP
 .B exclude
 Tailscale hostnames never to probe or search.
+.TP
+.B claude_exclude
+For
+.BR claude :
+regular expressions; sessions whose folder or first request matches one are hidden.
 .TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
@@ -416,6 +465,9 @@ Mount the root filesystem of every peer at
 .TP
 .B tailmon umount
 Unmount them again.
+.TP
+.B tailmon claude \-\-by host
+Claude Code sessions on every host, one table per machine.
 .SH SEE ALSO
 .BR tailscale (1),
 .BR ssh (1),
