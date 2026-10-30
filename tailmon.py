@@ -13,8 +13,10 @@ the local machine is probed directly.
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
     tailmon.py claude             Claude Code sessions on every host, grouped by how to finish them
     tailmon.py todo               ... as Todoist tasks, with points for finishing them
+    tailmon.py dispatch           hand Todoist tasks labelled @claude to Claude Code agents
 """
 import argparse
+import base64
 import calendar
 import concurrent.futures as cf
 import json
@@ -29,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 CONFIG_PATH = os.path.expanduser("~/.config/tailmon.json")
 DEFAULT_CONFIG = {
@@ -44,6 +47,9 @@ DEFAULT_CONFIG = {
     # `tailmon todo`: Todoist API token (or set TODOIST_API_TOKEN) and the project its tasks go to.
     "todoist_token": None,
     "todoist_project": "Claude sessions",
+    # `tailmon dispatch`: Todoist label that hands a task to an agent, and how many agents may run at once.
+    "dispatch_label": "claude",
+    "dispatch_max": 3,
     "sample_seconds": 1.0,
     # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
     "discover_seconds": 30.0,
@@ -744,18 +750,7 @@ CMD_RE = re.compile(r"(^|\n)\s*`*! \S|run (it|this|these|them) yourself|in your 
 
 
 def claude_cmd(node, cfg, is_self, days):
-    args = ["-", str(days)]
-    if is_self:
-        return [sys.executable, "-I"] + args
-    user = cfg["users"].get(node["name"], cfg["default_user"])
-    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-           "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=5",
-           "-o", "ServerAliveCountMax=3"]
-    if cfg.get("identity"):
-        ssh += ["-i", os.path.expanduser(cfg["identity"])]
-    ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
-    host = "%s@%s" % (user, node["name"]) if user else node["name"]
-    return ssh + [host, "python3", "-I"] + args
+    return remote_python(node, cfg, is_self, [str(days)])
 
 
 def claude_on_host(node, cfg, is_self, days):
@@ -1185,6 +1180,202 @@ def todo_main(argv):
     print(render_score(state))
     for r in errors:
         print("%s: ERROR: %s (its tasks were left alone)" % (r["node"], r["error"]), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------
+# Dispatch: Todoist tasks labelled @claude are handed to an unattended Claude Code agent on a host.
+# ---------------------------------------------------------------------------------------------
+AGENT_LAUNCHER = r'''
+import base64, json, os, shutil, subprocess, sys
+
+RUN = os.path.expanduser("~/.local/state/tailmon/agents")
+NOTE = ("You were started unattended from a Todoist task by `tailmon dispatch`; nobody is watching. "
+        "You can read and edit files, but you have no shell. Don't stop to ask questions: do what you can. "
+        "If the task needs a command run or a decision made, end your reply with exactly what the user "
+        "should run or decide. Your final reply is posted as a comment on the task.")
+
+def emit(value):
+    print(json.dumps(value))
+
+op, sid = sys.argv[1:3]
+out_path = os.path.join(RUN, sid + ".json")
+if op == "start":
+    folder = os.path.expanduser(sys.argv[3])
+    name, prompt = (base64.b64decode(x).decode() for x in sys.argv[4:6])
+    # Non-interactive ssh shells often lack ~/.local/bin on the PATH.
+    extra = [os.path.expanduser(p) for p in ("~/.local/bin", "~/.claude/local", "~/.npm-global/bin")]
+    claude = shutil.which("claude", path=os.pathsep.join([os.environ.get("PATH", "")] + extra))
+    if not claude:
+        emit({"error": "claude not found on this host"})
+    elif not os.path.isdir(folder):
+        emit({"error": "no such folder: %s" % folder})
+    else:
+        os.makedirs(RUN, exist_ok=True)
+        with open(out_path, "w") as out:
+            p = subprocess.Popen([claude, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
+                                  "--disallowedTools", "Bash", "--session-id", sid, "--name", name,
+                                  "--append-system-prompt", NOTE],
+                                 cwd=folder, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True)  # survives the ssh session
+        emit({"pid": p.pid})
+elif op == "check":
+    try:
+        with open("/proc/%s/cmdline" % sys.argv[3], "rb") as f:
+            running = sid.encode() in f.read()
+    except OSError:
+        running = False
+    try:
+        with open(out_path, errors="replace") as f:
+            output = f.read()[-20000:]
+    except OSError:
+        output = ""
+    emit({"running": running, "output": output})
+'''
+DISPATCH_STATE = os.path.expanduser("~/.local/state/tailmon/dispatch.json")
+
+
+def remote_python(node, cfg, is_self, args):
+    """Command running `python3 -I - args...` on the node (directly when it is this machine)."""
+    if is_self:
+        return [sys.executable, "-I", "-"] + args
+    user = cfg["users"].get(node["name"], cfg["default_user"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=5",
+           "-o", "ServerAliveCountMax=3"]
+    if cfg.get("identity"):
+        ssh += ["-i", os.path.expanduser(cfg["identity"])]
+    ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
+    host = "%s@%s" % (user, node["name"]) if user else node["name"]
+    # ssh passes the command through the remote login shell.
+    return ssh + [host] + [shlex.quote(value) for value in ["python3", "-I", "-"] + args]
+
+
+def launcher(node, cfg, is_self, args):
+    try:
+        r = subprocess.run(remote_python(node, cfg, is_self, args), input=AGENT_LAUNCHER, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout"}
+    if r.returncode != 0:
+        return {"error": ((r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1])[:160]}
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"error": "unreadable output"}
+
+
+def relabel(token, task_id, drop, add):
+    task = todoist(token, "GET", "/tasks/" + task_id)
+    if task:
+        labels = [l for l in task.get("labels", []) if l not in drop]
+        todoist(token, "POST", "/tasks/" + task_id, {"labels": labels + [add]})
+
+
+def agent_report(run, output):
+    """Todoist comment for an agent that stopped."""
+    resume = "Resume: `ssh %s`, then `cd %s && claude --resume %s`" % (run["node"], run["dir"], run["sid"])
+    try:
+        result = json.loads(output)
+    except ValueError:
+        return False, "Agent on %s stopped without a result:\n```\n%s\n```\n%s" % (
+            run["node"], output.strip()[-3000:] or "(no output)", resume)
+    ok = not result.get("is_error")
+    return ok, "Agent on %s, in %s (%s, %d turns, $%.2f):\n\n%s\n\n%s" % (
+        run["node"], run["dir"], result.get("subtype", "?"), result.get("num_turns", 0),
+        result.get("total_cost_usd", 0), result.get("result", "").strip()[:12000], resume)
+
+
+def dispatch_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon dispatch",
+                                 description="Hand Todoist tasks labelled @claude to Claude Code agents on the "
+                                             "tailnet, and post their reports back")
+    ap.add_argument("--dry-run", action="store_true", help="show what would start, without starting anything")
+    ap.add_argument("--status", action="store_true", help="only list the agents still running")
+    a = ap.parse_args(argv[1:])
+    try:
+        with open(DISPATCH_STATE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {"running": {}}
+    if a.status:
+        for task_id, run in state["running"].items():
+            print("%-12s %-16s %s  %s" % (run["started"], run["node"], run["dir"], run["content"]))
+        print("%d agent(s) running" % len(state["running"]))
+        return
+    cfg = load_config()
+    token = os.environ.get("TODOIST_API_TOKEN") or cfg["todoist_token"]
+    if not token:
+        sys.exit("tailmon: set TODOIST_API_TOKEN or \"todoist_token\" in %s" % CONFIG_PATH)
+    targets, _ = targets_for(cfg)
+    nodes = {n["name"].lower(): (n, is_self) for n, is_self in targets}
+    me = next(n["name"].lower() for n, is_self in targets if is_self)
+    label = cfg["dispatch_label"]
+
+    def save():
+        os.makedirs(os.path.dirname(DISPATCH_STATE), exist_ok=True)
+        with open(DISPATCH_STATE + ".tmp", "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(DISPATCH_STATE + ".tmp", DISPATCH_STATE)
+
+    try:
+        # Agents that stopped: post their report and mark the task done (or failed); you close it.
+        for task_id, run in list(state["running"].items()):
+            if run["node"].lower() not in nodes:
+                continue  # host offline: check next time
+            n, is_self = nodes[run["node"].lower()]
+            check = launcher(n, cfg, is_self, ["check", run["sid"], str(run["pid"])])
+            if "error" in check or check["running"]:
+                continue
+            ok, comment = agent_report(run, check["output"])
+            if a.dry_run:
+                print("would report  %s (%s)" % (run["content"], "done" if ok else "failed"))
+                continue
+            if todoist(token, "GET", "/tasks/" + task_id):
+                todoist(token, "POST", "/comments", {"task_id": task_id, "content": comment})
+                relabel(token, task_id, (label, label + "-running"), label + ("-done" if ok else "-failed"))
+            print("%s  %s" % ("done  " if ok else "failed", run["content"]))
+            del state["running"][task_id]
+            save()
+
+        # New @claude tasks: start an agent on the host named by another label, else here.
+        for task in todoist_all(token, "/tasks"):
+            if label not in task.get("labels", []) or task["id"] in state["running"]:
+                continue
+            hosts = [l.lower() for l in task["labels"] if l.lower() in nodes]
+            name = hosts[0] if hosts else me
+            folder = "~"
+            lines = []
+            for line in (task.get("description") or "").splitlines():
+                m = re.match(r"\s*dir:\s*(.+?)\s*$", line, re.I)
+                if m:
+                    folder = m.group(1)
+                else:
+                    lines.append(line)
+            if len(state["running"]) >= cfg["dispatch_max"]:
+                print("waiting  %s (already %d agents running)" % (task["content"], cfg["dispatch_max"]))
+                continue
+            if a.dry_run:
+                print("would start  [%s] %s: %s" % (name, folder, task["content"]))
+                continue
+            sid = str(uuid.uuid4())
+            prompt = "\n\n".join(x for x in [task["content"], "\n".join(lines).strip()] if x)
+            n, is_self = nodes[name]
+            started = launcher(n, cfg, is_self, ["start", sid, folder,
+                                                 base64.b64encode(("todo: " + task["content"])[:80].encode()).decode(),
+                                                 base64.b64encode(prompt.encode()).decode()])
+            if "error" in started:
+                print("%s: ERROR: %s (%s)" % (n["name"], started["error"], task["content"]), file=sys.stderr)
+                continue
+            state["running"][task["id"]] = {"node": n["name"], "sid": sid, "pid": started["pid"], "dir": folder,
+                                            "content": task["content"], "started": time.strftime("%m-%d %H:%M")}
+            save()
+            todoist(token, "POST", "/comments", {"task_id": task["id"], "content":
+                    "Agent started on %s in %s (session %s)." % (n["name"], folder, sid)})
+            relabel(token, task["id"], (label,), label + "-running")
+            print("started  [%s] %s: %s" % (n["name"], folder, task["content"]))
+    except TodoistError as exc:
+        sys.exit("tailmon: Todoist: %s" % exc)
+    print("%d agent(s) running" % len(state["running"]))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1637,6 +1828,8 @@ def main():
         return claude_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "todo":
         return todo_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "dispatch":
+        return dispatch_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")

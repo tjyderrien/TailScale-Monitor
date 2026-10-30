@@ -77,6 +77,10 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .IR N ]
 .RB [ \-\-hosts
 .IR LIST ]
+.br
+.B tailmon dispatch
+.RB [ \-\-dry\-run ]
+.RB [ \-\-status ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -323,6 +327,33 @@ List every finished task with its points, then the score.
 .BI \-\-days " N\fR, \fP" \-\-hosts " LIST"
 As for
 .BR claude .
+.SS "dispatch"
+Start an unattended Claude Code agent
+.RB ( "claude \-p" ,
+detached) for every open Todoist task labelled
+.BR @claude ,
+with the task title and description as the request. Another label naming a Tailscale host picks the
+machine (default: this one); a description line
+.B dir:
+.I path
+picks the folder (default: home). The agent may read and edit files but has no shell
+.RB ( "\-\-permission\-mode acceptEdits \-\-disallowedTools Bash" ).
+The label becomes
+.B @claude\-running
+and a comment gives the host, folder and session ID. On a later run, the final reply of each agent that
+stopped is posted as a comment, with the command to resume its session, and the label becomes
+.B @claude\-done
+or
+.BR @claude\-failed .
+Closing the task is left to you. At most
+.B dispatch_max
+agents run at once.
+.TP
+.B \-\-dry\-run
+Show which tasks would start and which reports would be posted.
+.TP
+.B \-\-status
+List the agents still running.
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -385,6 +416,8 @@ overrides any of the built\-in defaults:
   "claude_exclude": ["Downloads"],
   "todoist_token": "0123abcd...",
   "todoist_project": "Claude sessions",
+  "dispatch_label": "claude",
+  "dispatch_max": 3,
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -432,6 +465,17 @@ For
 the Todoist project for the tasks, created if missing. Default
 .BR "Claude sessions" .
 .TP
+.B dispatch_label
+For
+.BR dispatch :
+the label that hands a task to an agent. Default
+.BR claude .
+.TP
+.B dispatch_max
+For
+.BR dispatch :
+how many agents may run at once. Default 3.
+.TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
 .TP
@@ -465,7 +509,9 @@ If set, disable colors.
 .TP
 .B TODOIST_API_TOKEN
 Todoist API token for
-.BR todo .
+.B todo
+and
+.BR dispatch .
 .SH FILES
 .TP
 .I ~/.config/tailmon.json
@@ -474,6 +520,13 @@ Optional configuration file.
 .I ~/.local/state/tailmon/todo.json
 Points, history and open tasks of
 .BR todo .
+.TP
+.I ~/.local/state/tailmon/dispatch.json
+Agents started by
+.BR dispatch ;
+their output is in
+.I ~/.local/state/tailmon/agents/
+on the host that runs them.
 .TP
 .I ~/.ssh/config
 Per\-host SSH settings, honored as described above.
@@ -533,6 +586,9 @@ Claude Code sessions on every host, one table per machine.
 .TP
 .B tailmon todo
 Sync them to Todoist and show your points.
+.TP
+.B tailmon dispatch
+Start agents for the Todoist tasks labelled @claude.
 .SH SEE ALSO
 .BR tailscale (1),
 .BR ssh (1),
