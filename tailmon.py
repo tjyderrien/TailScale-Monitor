@@ -12,6 +12,7 @@ the local machine is probed directly.
     tailmon.py --hosts web-1,db-1
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
     tailmon.py claude             Claude Code sessions on every host, grouped by how to finish them
+    tailmon.py todo               ... as Todoist tasks, with points for finishing them
 """
 import argparse
 import calendar
@@ -25,6 +26,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 CONFIG_PATH = os.path.expanduser("~/.config/tailmon.json")
 DEFAULT_CONFIG = {
@@ -37,6 +41,9 @@ DEFAULT_CONFIG = {
     "exclude": [],
     # `tailmon claude`: regexes on a session's folder or first request; matching sessions are hidden.
     "claude_exclude": [],
+    # `tailmon todo`: Todoist API token (or set TODOIST_API_TOKEN) and the project its tasks go to.
+    "todoist_token": None,
+    "todoist_project": "Claude sessions",
     "sample_seconds": 1.0,
     # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
     "discover_seconds": 30.0,
@@ -922,6 +929,24 @@ def render_claude(sessions, show_all, by, markdown=False):
     return "\n".join(lines)
 
 
+def claude_sessions(cfg, only, days):
+    """Classified sessions of every target host; returns (sessions, errors, skipped, targets)."""
+    targets, skipped = targets_for(cfg, only)
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(lambda t: claude_on_host(t[0], cfg, t[1], days), targets))
+    exclude = [re.compile(p, re.I) for p in cfg["claude_exclude"]]
+    sessions, errors = [], [r for r in results if "error" in r]
+    for data in results:
+        for s in data.get("sessions", []):
+            if not any(p.search(s["cwd"]) or p.search(s["first_prompt"]) for p in exclude):
+                sessions.append(dict(s, node=data["node"], home=data["home"]))
+    sessions = claude_dedupe(sessions)
+    for s in sessions:
+        s["state"] = claude_classify(s)
+        s["method"] = claude_method(s)
+    return sessions, errors, skipped, targets
+
+
 def claude_main(argv):
     ap = argparse.ArgumentParser(prog="tailmon claude",
                                  description="List the Claude Code sessions on every host and group them "
@@ -936,20 +961,7 @@ def claude_main(argv):
     a = ap.parse_args(argv[1:])
     cfg = load_config()
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
-    targets, skipped = targets_for(cfg, only)
-    with cf.ThreadPoolExecutor(max_workers=16) as ex:
-        results = list(ex.map(lambda t: claude_on_host(t[0], cfg, t[1], a.days), targets))
-
-    exclude = [re.compile(p, re.I) for p in cfg["claude_exclude"]]
-    sessions, errors = [], [r for r in results if "error" in r]
-    for data in results:
-        for s in data.get("sessions", []):
-            if not any(p.search(s["cwd"]) or p.search(s["first_prompt"]) for p in exclude):
-                sessions.append(dict(s, node=data["node"], home=data["home"]))
-    sessions = claude_dedupe(sessions)
-    for s in sessions:
-        s["state"] = claude_classify(s)
-        s["method"] = claude_method(s)
+    sessions, errors, skipped, targets = claude_sessions(cfg, only, a.days)
 
     if a.json:
         print(json.dumps({"sessions": sessions, "errors": errors,
@@ -967,6 +979,212 @@ def claude_main(argv):
     if skipped:
         print("not checked: " + ", ".join(
             "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------
+# Todoist: one task per pending Claude session; finishing it (in Todoist or for real) earns points.
+# ---------------------------------------------------------------------------------------------
+TODOIST_API = os.environ.get("TODOIST_API_URL", "https://api.todoist.com/api/v1")
+TODO_STATE = os.path.expanduser("~/.local/state/tailmon/todo.json")
+# Points per way of finishing a session; RUNNING ("WAIT") and DONE sessions get no task.
+TODO_POINTS = {"COMMAND": 10, "GIT": 10, "ANSWER": 15, "RESTART": 25, "CLOSE": 5}
+TODO_VERBS = {"COMMAND": "Run", "GIT": "Commit/push", "ANSWER": "Answer", "RESTART": "Restart", "CLOSE": "Close"}
+LEVEL_POINTS = 100
+
+
+class TodoistError(Exception):
+    pass
+
+
+def todoist(token, method, path, body=None):
+    req = urllib.request.Request(TODOIST_API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise TodoistError("%s %s: HTTP %d %s" % (method, path, exc.code, exc.read()[:200].decode(errors="replace")))
+    except (urllib.error.URLError, OSError) as exc:
+        raise TodoistError("%s %s: %s" % (method, path, exc))
+    return json.loads(raw) if raw else {}
+
+
+def todoist_all(token, path):
+    """Follow next_cursor through a paginated listing."""
+    items, cursor = [], None
+    while True:
+        sep = "&" if "?" in path else "?"
+        page = todoist(token, "GET", path + (sep + "cursor=" + urllib.parse.quote(cursor) if cursor else ""))
+        items += page.get("results", [])
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return items
+
+
+def todo_project(token, name):
+    for p in todoist_all(token, "/projects"):
+        if p["name"] == name:
+            return p["id"]
+    return todoist(token, "POST", "/projects", {"name": name})["id"]
+
+
+def todo_key(s):
+    # One git task per folder, as in the report; otherwise one task per session.
+    return "%s:%s" % (s["node"], s["cwd"] if s["method"] == "GIT" else s["id"])
+
+
+def todo_task(s):
+    content = "%s [%s] %s: %s" % (TODO_VERBS[s["method"]], s["node"], project(s), one_line(next_step(s), 200))
+    description = "Folder: %s on %s\nResume: cd %s && claude --resume\nWorth %d points (tailmon todo)" % (
+        s["cwd"] or s["home"], s["node"], shlex.quote(s["cwd"] or s["home"]), TODO_POINTS[s["method"]])
+    return content, description
+
+
+def load_todo_state():
+    try:
+        with open(TODO_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"tasks": {}, "log": []}
+
+
+def save_todo_state(state):
+    os.makedirs(os.path.dirname(TODO_STATE), exist_ok=True)
+    tmp = TODO_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, TODO_STATE)
+
+
+def streak(log):
+    """Consecutive days, ending today or yesterday, with at least one finished task."""
+    days = {e["date"] for e in log}
+    day = time.time()
+    if time.strftime("%Y-%m-%d", time.localtime(day)) not in days:
+        day -= 86400
+    n = 0
+    while time.strftime("%Y-%m-%d", time.localtime(day)) in days:
+        n += 1
+        day -= 86400
+    return n
+
+
+def render_score(state):
+    total = sum(e["points"] for e in state["log"])
+    today = time.strftime("%Y-%m-%d")
+    level, into = divmod(total, LEVEL_POINTS)
+    return "%d points (today %d)  level %d %s %d/%d  streak %d day(s)  %d task(s) open" % (
+        total, sum(e["points"] for e in state["log"] if e["date"] == today), level + 1,
+        bar(100.0 * into / LEVEL_POINTS), into, LEVEL_POINTS, streak(state["log"]), len(state["tasks"]))
+
+
+def todo_sync(token, cfg, sessions, reachable, days, dry_run):
+    """Mirror pending sessions into Todoist; returns (state, [log entries earned now], [created], [closed])."""
+    state = load_todo_state()
+    state.setdefault("dismissed", {})
+    # A day of margin: a session a little younger than --days may have dropped out between two runs.
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - (days - 1) * 86400))
+    pending = {todo_key(s): s for s in sorted(sessions, key=lambda s: s["end"])
+               if s["method"] in TODO_POINTS}
+    project_id = todo_project(token, cfg["todoist_project"]) if not dry_run else None
+    open_ids = {t["id"] for t in todoist_all(token, "/tasks?project_id=" + project_id)} if not dry_run else None
+    earned, created, closed = [], [], []
+
+    def award(key, task, why):
+        entry = {"date": time.strftime("%Y-%m-%d"), "time": time.strftime("%H:%M"), "points": task["points"],
+                 "what": task["content"], "how": why}
+        earned.append(entry)
+        state["log"].append(entry)
+        del state["tasks"][key]
+
+    for key, task in list(state["tasks"].items()):
+        if dry_run:
+            if key not in pending and key.split(":", 1)[0] in reachable:
+                closed.append(task["content"])
+            continue
+        if task["id"] not in open_ids:
+            # Gone from the project: ticked off in Todoist (points) or deleted there (none).
+            t = todoist(token, "GET", "/tasks/" + task["id"])
+            if t and t.get("checked") and not t.get("is_deleted"):
+                award(key, task, "checked in Todoist")
+            else:
+                del state["tasks"][key]
+                state["dismissed"][key] = True  # deleted in Todoist: don't add it back
+        elif key not in pending and key.split(":", 1)[0] in reachable:
+            todoist(token, "POST", "/tasks/%s/close" % task["id"])
+            closed.append(task["content"])
+            if task.get("end", "") < cutoff:
+                del state["tasks"][key]  # older than --days, so not seen: not proof it was finished
+            else:
+                # The session no longer needs anything: it was finished outside Todoist.
+                award(key, task, "finished in the session")
+    state["dismissed"] = {k: v for k, v in state["dismissed"].items() if k in pending}
+    for key, s in pending.items():
+        if key in state["dismissed"]:
+            continue
+        content, description = todo_task(s)
+        if key in state["tasks"]:
+            task = state["tasks"][key]
+            if task["content"] != content and not dry_run:
+                todoist(token, "POST", "/tasks/" + task["id"], {"content": content, "description": description})
+                task.update(content=content, points=TODO_POINTS[s["method"]])
+            task["end"] = s["end"]
+            continue
+        created.append(content)
+        if not dry_run:
+            t = todoist(token, "POST", "/tasks", {"content": content, "description": description,
+                                                   "project_id": project_id})
+            state["tasks"][key] = {"id": t["id"], "content": content, "points": TODO_POINTS[s["method"]],
+                                   "end": s["end"]}
+    if not dry_run:
+        save_todo_state(state)
+    return state, earned, created, closed
+
+
+def todo_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon todo",
+                                 description="Turn pending Claude Code sessions into Todoist tasks and earn "
+                                             "points for finishing them")
+    ap.add_argument("--days", type=float, default=60, help="look back this many days (default %(default)g)")
+    ap.add_argument("--hosts", help="comma-separated Tailscale hostnames")
+    ap.add_argument("--dry-run", action="store_true", help="show what would change, without touching Todoist")
+    ap.add_argument("--score", action="store_true", help="only show points, level and streak")
+    ap.add_argument("--log", action="store_true", help="list the finished tasks and their points")
+    a = ap.parse_args(argv[1:])
+    if a.score or a.log:
+        state = load_todo_state()
+        if a.log:
+            for e in state["log"]:
+                print("%s %s  +%-3d %s (%s)" % (e["date"], e["time"], e["points"], e["what"], e["how"]))
+        print(render_score(state))
+        return
+    cfg = load_config()
+    token = os.environ.get("TODOIST_API_TOKEN") or cfg["todoist_token"]
+    if not token and not a.dry_run:
+        sys.exit("tailmon: set TODOIST_API_TOKEN or \"todoist_token\" in %s\n"
+                 "  (token: Todoist > Settings > Integrations > Developer)" % CONFIG_PATH)
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    sessions, errors, skipped, targets = claude_sessions(cfg, only, a.days)
+    reachable = {n["name"] for n, _ in targets} - {r["node"] for r in errors}
+    try:
+        state, earned, created, closed = todo_sync(token, cfg, sessions, reachable, a.days, a.dry_run)
+    except TodoistError as exc:
+        sys.exit("tailmon: Todoist: %s" % exc)
+    prefix = "would " if a.dry_run else ""
+    for content in created:
+        print("%sadd    %s" % (prefix, content))
+    for content in closed:
+        print("%sclose  %s" % (prefix, content))
+    for e in earned:
+        print(c("+%-3d", 0) % e["points"] + "  %s (%s)" % (e["what"], e["how"]))
+    if not (created or closed or earned):
+        print("Todoist is up to date")
+    print(render_score(state))
+    for r in errors:
+        print("%s: ERROR: %s (its tasks were left alone)" % (r["node"], r["error"]), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1417,6 +1635,8 @@ def main():
         return mount_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "claude":
         return claude_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "todo":
+        return todo_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")

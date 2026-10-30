@@ -68,6 +68,15 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-hosts
 .IR LIST ]
 .RB [ \-\-json ]
+.br
+.B tailmon todo
+.RB [ \-\-dry\-run ]
+.RB [ \-\-score ]
+.RB [ \-\-log ]
+.RB [ \-\-days
+.IR N ]
+.RB [ \-\-hosts
+.IR LIST ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -285,6 +294,35 @@ Only these comma\-separated Tailscale hostnames.
 Print
 .B {"sessions": [...], "errors": [...], "skipped": [...]}
 instead of the report.
+.SS "todo"
+Add a Todoist task for every session that
+.B claude
+lists as pending (running sessions excepted), in the project named by
+.BR todoist_project .
+A task ticked off in Todoist earns its points; so does a task whose session no longer needs anything,
+which is then closed. A task deleted in Todoist earns nothing and is not added again; one whose session got
+older than
+.B \-\-days
+is closed without points. Tasks of hosts that could not be reached are left alone.
+Points: 10 to run a command or commit/push, 15 to answer, 25 to restart a task, 5 to close an idle session.
+Every 100 points is a level; the streak counts consecutive days with a finished task.
+Needs a Todoist API token in
+.B TODOIST_API_TOKEN
+or
+.BR todoist_token .
+.TP
+.B \-\-dry\-run
+Show what would be added or closed, without contacting Todoist.
+.TP
+.B \-\-score
+Only print points, level and streak.
+.TP
+.B \-\-log
+List every finished task with its points, then the score.
+.TP
+.BI \-\-days " N\fR, \fP" \-\-hosts " LIST"
+As for
+.BR claude .
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -345,6 +383,8 @@ overrides any of the built\-in defaults:
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer\-pi"],
   "claude_exclude": ["Downloads"],
+  "todoist_token": "0123abcd...",
+  "todoist_project": "Claude sessions",
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -378,6 +418,20 @@ For
 .BR claude :
 regular expressions; sessions whose folder or first request matches one are hidden.
 .TP
+.B todoist_token
+For
+.BR todo :
+Todoist API token. Default
+.BR null :
+use
+.BR TODOIST_API_TOKEN .
+.TP
+.B todoist_project
+For
+.BR todo :
+the Todoist project for the tasks, created if missing. Default
+.BR "Claude sessions" .
+.TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
 .TP
@@ -408,10 +462,18 @@ so key\-based, non\-interactive access is required.
 .TP
 .B NO_COLOR
 If set, disable colors.
+.TP
+.B TODOIST_API_TOKEN
+Todoist API token for
+.BR todo .
 .SH FILES
 .TP
 .I ~/.config/tailmon.json
 Optional configuration file.
+.TP
+.I ~/.local/state/tailmon/todo.json
+Points, history and open tasks of
+.BR todo .
 .TP
 .I ~/.ssh/config
 Per\-host SSH settings, honored as described above.
@@ -468,6 +530,9 @@ Unmount them again.
 .TP
 .B tailmon claude \-\-by host
 Claude Code sessions on every host, one table per machine.
+.TP
+.B tailmon todo
+Sync them to Todoist and show your points.
 .SH SEE ALSO
 .BR tailscale (1),
 .BR ssh (1),

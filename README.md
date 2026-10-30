@@ -28,7 +28,8 @@ server-1         64 cores  load 0.10 0.07 0.07
   `sshfs`, so ordinary programs (image viewers, scripts, …) can open files from all machines at once,
   with the same path layout on every host.
 - **Claude Code sessions.** `claude` lists the [Claude Code](https://claude.com/claude-code) sessions on every
-  host and groups the unfinished ones by what you have to do to finish them.
+  host and groups the unfinished ones by what you have to do to finish them. `todo` turns them into
+  [Todoist](https://todoist.com) tasks and gives you points for finishing them.
 
 ## Requirements
 
@@ -155,6 +156,38 @@ To pick a session back up, go to its folder on that machine and run `claude --re
 keywords in each session's last reply, so a few sessions land in the wrong group. When a task was resumed in
 several sessions, only the most recent is shown.
 
+### Todoist tasks and points
+
+```sh
+export TODOIST_API_TOKEN=...      # Todoist > Settings > Integrations > Developer
+./tailmon.py todo --dry-run       # what would be added or closed
+./tailmon.py todo                 # sync: one task per pending session, in the "Claude sessions" project
+./tailmon.py todo --score         # points, level and streak, without syncing
+./tailmon.py todo --log           # every finished task and what it earned
+```
+
+Each run adds a task for every session `claude` lists as pending (except running ones) and checks the
+existing tasks:
+
+- ticked off in Todoist: you earn its points;
+- the session no longer needs anything (you pushed, answered, …) but the task is still open: the task is
+  closed and you earn its points too;
+- deleted in Todoist: no points, and it isn't added again;
+- the session got older than `--days`: closed, no points.
+
+| Task                 | Points |
+|----------------------|-------:|
+| Run a command        | 10     |
+| Commit / push git    | 10     |
+| Answer the session   | 15     |
+| Restart the task     | 25     |
+| Close an idle session| 5      |
+
+Every 100 points is a level; the streak counts consecutive days with at least one finished task. Hosts that
+are offline or unreachable are left alone, so their tasks don't count as finished. Points and the task list
+are kept in `~/.local/state/tailmon/todo.json`. To sync regularly, run `tailmon todo` from cron or a systemd
+timer.
+
 ## Configuration
 
 Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in default:
@@ -166,6 +199,8 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer-pi"],
   "claude_exclude": ["Downloads"],
+  "todoist_token": "0123abcd...",
+  "todoist_project": "Claude sessions",
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -178,6 +213,8 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `identity`         | SSH private key passed with `-i` (default `null`: your usual SSH keys / agent)           |
 | `exclude`          | Tailscale hostnames never to probe                                                       |
 | `claude_exclude`   | For `claude`: regular expressions; sessions whose folder or first request matches are hidden |
+| `todoist_token`    | For `todo`: Todoist API token (default `null`: use `TODOIST_API_TOKEN`)                  |
+| `todoist_project`  | For `todo`: Todoist project the tasks go to, created if missing (default `Claude sessions`) |
 | `sample_seconds`   | Measurement window for rates (CPU %, disk / network throughput) in snapshot mode         |
 | `discover_seconds` | In watch mode, how often to re-run `tailscale status` to find new or departed hosts      |
 
