@@ -975,7 +975,7 @@ def watch(cfg, only, a):
 
 
 def file_main(argv):
-    ap = argparse.ArgumentParser(description="Search or grep files across the Tailscale network")
+    ap = argparse.ArgumentParser(prog="tailmon", description="Search or grep files across the Tailscale network")
     sub = ap.add_subparsers(dest="operation")
 
     def common(parser):

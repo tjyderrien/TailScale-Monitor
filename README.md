@@ -56,6 +56,8 @@ tailmon is a single script. To run it as `tailmon` from anywhere, link it into a
 mkdir -p ~/.local/bin && ln -s "$PWD/tailmon.py" ~/.local/bin/tailmon
 ```
 
+The examples below use `tailmon`; without the link, run `./tailmon.py` from the repository instead.
+
 ## Manual page
 
 A man page is included. Read it in place with `man -l tailmon.1`, or install it:
@@ -71,13 +73,13 @@ man tailmon
 ### Monitoring
 
 ```sh
-./tailmon.py                         # one snapshot of every online Linux node
-./tailmon.py -w 1                    # live view, refreshed every second
-./tailmon.py -w 5                    # ... every 5 seconds
-./tailmon.py --hosts web-1,db-1      # only these Tailscale hostnames
-./tailmon.py --json                  # machine-readable snapshot
-./tailmon.py -w 60 --log m.jsonl     # keep a history: one JSON object per host per sample
-./tailmon.py -w 60 --log m.jsonl --quiet   # same, without drawing (for cron / systemd)
+tailmon                              # one snapshot of every online Linux node
+tailmon -w 1                         # live view, refreshed every second
+tailmon -w 5                         # ... every 5 seconds
+tailmon --hosts web-1,db-1           # only these Tailscale hostnames
+tailmon --json                       # machine-readable snapshot
+tailmon -w 60 --log m.jsonl          # keep a history: one JSON object per host per sample
+tailmon -w 60 --log m.jsonl --quiet  # same, without drawing (for cron / systemd)
 ```
 
 Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1` to disable them.
@@ -85,13 +87,13 @@ Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1
 ### Files across the tailnet
 
 ```sh
-./tailmon.py search /var/log --name '*.log' # find matching files on every peer
-./tailmon.py grep 'ERROR|WARN' /var/log -i  # grep file contents across the tailnet
-./tailmon.py search /media --name '*.pdf' -vv --timeout 0  # live progress, no time limit
-./tailmon.py grep --fixed-strings 'needle' /home --hosts server-1 --json
-./tailmon.py mount                          # every peer's / at /media/tailscale/<host>
-./tailmon.py mount --path /data --hosts gpu-box,server-1
-./tailmon.py umount                         # unmount everything under /media/tailscale
+tailmon search /var/log --name '*.log'            # find matching files on every peer
+tailmon grep 'ERROR|WARN' /var/log -i             # grep file contents across the tailnet
+tailmon search /media --name '*.pdf' -vv --timeout 0  # live progress, no time limit
+tailmon grep --fixed-strings 'needle' /home --hosts server-1 --json
+tailmon mount                                     # every peer's / at /media/tailscale/<host>
+tailmon mount --path /data --hosts gpu-box,server-1
+tailmon umount                                    # unmount everything under /media/tailscale
 ```
 
 `search` and `grep` use the same SSH configuration as monitoring. They skip hidden files by default,
@@ -102,8 +104,9 @@ limit output to 1,000 results, and only search online Linux peers. Use `--hidden
 Each host gets 300 seconds (`--timeout SEC`, `0` for no limit); a host that runs out of time keeps what
 it found so far, and the error says which path it was reading. `-v` prints a per-host summary (matches,
 time, directories and files walked, depth reached below the root) on stderr. `-vv` also shows a live
-progress bar per host with the current depth / deepest so far and the path being searched, redrawn in place without scrolling. It costs a little extra traffic: each host
-sends its position twice a second, only when it changed, which also shows where a slow disk is stuck:
+progress bar per host with the current depth / deepest so far and the path being searched, redrawn in
+place without scrolling. It costs a little extra traffic: each host sends its position twice a second,
+only when it changed, which also shows where a slow disk is stuck:
 
 ```
 asus             ████████████████████ 100%    699 found    1.5s  done: 5366 dirs, 28871 files, depth 9
