@@ -48,8 +48,14 @@ DEFAULT_CONFIG = {
     "todoist_token": None,
     "todoist_project": "Claude sessions",
     # `tailmon dispatch`: Todoist label that hands a task to an agent, and how many agents may run at once.
+    # Claude accounts (e.g. seats of a Team plan): name -> config dir, logged in once per host with
+    # `CLAUDE_CONFIG_DIR=<dir> claude`. ~/.claude is always included, as "default" unless named here.
+    "claude_accounts": {},
     "dispatch_label": "claude",
-    "dispatch_max": 3,
+    "dispatch_project": "Claude-Tasks",
+    "dispatch_max": 3,  # per account
+    # Hours an account is left alone after one of its agents hit the usage limit.
+    "dispatch_rest_hours": 1.0,
     "sample_seconds": 1.0,
     # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
     "discover_seconds": 30.0,
@@ -600,6 +606,7 @@ CLAUDE_AGENT = r'''
 import glob, json, os, re, subprocess, sys, time
 
 DAYS = float(sys.argv[1])
+CONFIGS = sys.argv[2:] or ["~/.claude"]
 HOME = os.path.expanduser("~")
 NOISE = ("<command", "<local-command", "<system", "<bash-", "<task-notification",
          "[Request interrupted", "Caveat:", "This session is being continued")
@@ -619,10 +626,10 @@ def text_of(row):
             has_tool_result = True
     return "\n".join(parts), has_tool_use, has_tool_result
 
-def live_sessions():
+def live_sessions(config):
     """Session id -> registry entry, for processes that are still alive."""
     live = {}
-    for path in glob.glob(os.path.join(HOME, ".claude/sessions/*.json")):
+    for path in glob.glob(os.path.join(os.path.expanduser(config), "sessions/*.json")):
         try:
             with open(path) as f:
                 entry = json.load(f)
@@ -699,21 +706,24 @@ def summarize(path, live):
         "git": git_state(cwd),
     }
 
-live = live_sessions()
 cutoff = time.time() - DAYS * 86400
 sessions = []
-for path in glob.glob(os.path.join(HOME, ".claude/projects/*/*.jsonl")):
-    try:
-        if os.path.getmtime(path) < cutoff:
+for config in CONFIGS:
+    live = live_sessions(config)
+    for path in glob.glob(os.path.join(os.path.expanduser(config), "projects/*/*.jsonl")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                continue
+            summary = summarize(path, live)
+        except OSError:
             continue
-        summary = summarize(path, live)
-    except OSError:
-        continue
-    if summary:
-        sessions.append(summary)
+        if summary:
+            summary["config"] = config
+            sessions.append(summary)
 json.dump({"home": HOME, "sessions": sessions}, sys.stdout)
 '''
 
+DEFAULT_CLAUDE = "~/.claude"
 # Session state, in report order; the first matching rule in classify() wins.
 CLAUDE_STATES = [
     ("RUNNING", "Running now"),
@@ -749,8 +759,22 @@ CMD_RE = re.compile(r"(^|\n)\s*`*! \S|run (it|this|these|them) yourself|in your 
                     r"you need to run|dans votre propre terminal|lance[rz]? (cette|la) commande", re.I)
 
 
+def claude_accounts(cfg):
+    """Account name -> Claude config dir; ~/.claude is always one of them."""
+    accounts = dict(cfg["claude_accounts"])
+    if DEFAULT_CLAUDE not in accounts.values():
+        accounts = dict([("default", DEFAULT_CLAUDE)] + list(accounts.items()))
+    return accounts
+
+
+def resume_cmd(config, sid=""):
+    # ~/.claude is the default: setting CLAUDE_CONFIG_DIR to it would also move ~/.claude.json.
+    env = "" if config in (None, DEFAULT_CLAUDE) else "CLAUDE_CONFIG_DIR=%s " % config
+    return ("%sclaude --resume %s" % (env, sid)).strip()
+
+
 def claude_cmd(node, cfg, is_self, days):
-    return remote_python(node, cfg, is_self, [str(days)])
+    return remote_python(node, cfg, is_self, [str(days)] + list(claude_accounts(cfg).values()))
 
 
 def claude_on_host(node, cfg, is_self, days):
@@ -930,11 +954,13 @@ def claude_sessions(cfg, only, days):
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         results = list(ex.map(lambda t: claude_on_host(t[0], cfg, t[1], days), targets))
     exclude = [re.compile(p, re.I) for p in cfg["claude_exclude"]]
+    names = {d: n for n, d in claude_accounts(cfg).items()}
     sessions, errors = [], [r for r in results if "error" in r]
     for data in results:
         for s in data.get("sessions", []):
             if not any(p.search(s["cwd"]) or p.search(s["first_prompt"]) for p in exclude):
-                sessions.append(dict(s, node=data["node"], home=data["home"]))
+                sessions.append(dict(s, node=data["node"], home=data["home"],
+                                     account=names.get(s.get("config"), s.get("config"))))
     sessions = claude_dedupe(sessions)
     for s in sessions:
         s["state"] = claude_classify(s)
@@ -1033,8 +1059,9 @@ def todo_key(s):
 
 def todo_task(s):
     content = "%s [%s] %s: %s" % (TODO_VERBS[s["method"]], s["node"], project(s), one_line(next_step(s), 200))
-    description = "Folder: %s on %s\nResume: cd %s && claude --resume\nWorth %d points (tailmon todo)" % (
-        s["cwd"] or s["home"], s["node"], shlex.quote(s["cwd"] or s["home"]), TODO_POINTS[s["method"]])
+    description = "Folder: %s on %s\nResume: cd %s && %s\nWorth %d points (tailmon todo)" % (
+        s["cwd"] or s["home"], s["node"], shlex.quote(s["cwd"] or s["home"]), resume_cmd(s.get("config")),
+        TODO_POINTS[s["method"]])
     return content, description
 
 
@@ -1197,11 +1224,18 @@ NOTE = ("You were started unattended from a Todoist task by `tailmon dispatch`; 
 def emit(value):
     print(json.dumps(value))
 
-op, sid = sys.argv[1:3]
+op = sys.argv[1]
+if op == "accounts":  # which config dirs hold a login
+    emit({d: os.path.exists(os.path.join(os.path.expanduser(d), ".credentials.json")) for d in sys.argv[2:]})
+    raise SystemExit
+sid = sys.argv[2]
 out_path = os.path.join(RUN, sid + ".json")
 if op == "start":
-    folder = os.path.expanduser(sys.argv[3])
-    name, prompt = (base64.b64decode(x).decode() for x in sys.argv[4:6])
+    folder, config = os.path.expanduser(sys.argv[3]), sys.argv[4]
+    name, prompt = (base64.b64decode(x).decode() for x in sys.argv[5:7])
+    env = dict(os.environ)
+    if config != "~/.claude":  # the default; setting it would also move ~/.claude.json
+        env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config)
     # Non-interactive ssh shells often lack ~/.local/bin on the PATH.
     extra = [os.path.expanduser(p) for p in ("~/.local/bin", "~/.claude/local", "~/.npm-global/bin")]
     claude = shutil.which("claude", path=os.pathsep.join([os.environ.get("PATH", "")] + extra))
@@ -1215,7 +1249,7 @@ if op == "start":
             p = subprocess.Popen([claude, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
                                   "--disallowedTools", "Bash", "--session-id", sid, "--name", name,
                                   "--append-system-prompt", NOTE],
-                                 cwd=folder, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 cwd=folder, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  start_new_session=True)  # survives the ssh session
         emit({"pid": p.pid, "created": created})
 elif op == "check":
@@ -1273,17 +1307,23 @@ def relabel(token, task_id, drop, add):
 
 
 def agent_report(run, output):
-    """Todoist comment for an agent that stopped."""
-    resume = "Resume: `ssh %s`, then `cd %s && claude --resume %s`" % (run["node"], run["dir"], run["sid"])
+    """(outcome, Todoist comment) for an agent that stopped; outcome is "done", "failed" or "limit"."""
+    resume = "Resume: `ssh %s`, then `cd %s && %s`" % (run["node"], run["dir"],
+                                                      resume_cmd(run.get("config"), run["sid"]))
+    where = "Agent on %s, account %s" % (run["node"], run.get("account", "default"))
     try:
         result = json.loads(output)
     except ValueError:
-        return False, "Agent on %s stopped without a result:\n```\n%s\n```\n%s" % (
-            run["node"], output.strip()[-3000:] or "(no output)", resume)
-    ok = not result.get("is_error")
-    return ok, "Agent on %s, in %s (%s, %d turns, $%.2f):\n\n%s\n\n%s" % (
-        run["node"], run["dir"], result.get("subtype", "?"), result.get("num_turns", 0),
-        result.get("total_cost_usd", 0), result.get("result", "").strip()[:12000], resume)
+        outcome = "limit" if LIMIT_RE.search(output[-500:]) else "failed"
+        return outcome, "%s, stopped without a result:\n```\n%s\n```\n%s" % (
+            where, output.strip()[-3000:] or "(no output)", resume)
+    text = result.get("result", "").strip()
+    if LIMIT_RE.search(text[-300:]):
+        return "limit", "%s, hit its usage limit; the task will be retried on another account.\n\n%s" % (
+            where, resume)
+    return "failed" if result.get("is_error") else "done", "%s, in %s (%s, %d turns, $%.2f):\n\n%s\n\n%s" % (
+        where, run["dir"], result.get("subtype", "?"), result.get("num_turns", 0),
+        result.get("total_cost_usd", 0), text[:12000], resume)
 
 
 def dispatch_main(argv):
@@ -1292,18 +1332,37 @@ def dispatch_main(argv):
                                              "tailnet, and post their reports back")
     ap.add_argument("--dry-run", action="store_true", help="show what would start, without starting anything")
     ap.add_argument("--status", action="store_true", help="only list the agents still running")
+    ap.add_argument("--accounts", action="store_true", help="show which Claude accounts are logged in on each host")
     a = ap.parse_args(argv[1:])
     try:
         with open(DISPATCH_STATE) as f:
             state = json.load(f)
     except (OSError, ValueError):
         state = {"running": {}}
+    state.setdefault("rest", {})
+    cfg = load_config()
+    accounts = claude_accounts(cfg)
     if a.status:
         for task_id, run in state["running"].items():
-            print("%-12s %-16s %s  %s" % (run["started"], run["node"], run["dir"], run["content"]))
+            print("%-12s %-16s %-10s %s  %s" % (run["started"], run["node"], run.get("account", "default"),
+                                                 run["dir"], run["content"]))
+        for name, until in sorted(state["rest"].items()):
+            if until > time.time():
+                print("account %s rests until %s (usage limit)" % (name, time.strftime("%H:%M", time.localtime(until))))
         print("%d agent(s) running" % len(state["running"]))
         return
-    cfg = load_config()
+    if a.accounts:
+        targets, _ = targets_for(cfg)
+        with cf.ThreadPoolExecutor(max_workers=16) as ex:
+            found = list(ex.map(lambda t: launcher(t[0], cfg, t[1], ["accounts"] + list(accounts.values())), targets))
+        for (n, _), logins in zip(targets, found):
+            if "error" in logins:
+                print("%-16s ERROR: %s" % (n["name"], logins["error"]))
+            else:
+                print("%-16s %s" % (n["name"], "  ".join(
+                    "%s %s" % (name, "ok" if logins.get(d) else "-") for name, d in accounts.items())))
+        print("log an account in on a host with:  CLAUDE_CONFIG_DIR=<dir> claude   (then /login)")
+        return
     token = os.environ.get("TODOIST_API_TOKEN") or cfg["todoist_token"]
     if not token:
         sys.exit("tailmon: set TODOIST_API_TOKEN or \"todoist_token\" in %s" % CONFIG_PATH)
@@ -1311,6 +1370,7 @@ def dispatch_main(argv):
     nodes = {n["name"].lower(): (n, is_self) for n, is_self in targets}
     me = next(n["name"].lower() for n, is_self in targets if is_self)
     label = cfg["dispatch_label"]
+    logged_in = {}  # host -> names of the accounts logged in there
 
     def save():
         os.makedirs(os.path.dirname(DISPATCH_STATE), exist_ok=True)
@@ -1327,14 +1387,18 @@ def dispatch_main(argv):
             check = launcher(n, cfg, is_self, ["check", run["sid"], str(run["pid"])])
             if "error" in check or check["running"]:
                 continue
-            ok, comment = agent_report(run, check["output"])
+            outcome, comment = agent_report(run, check["output"])
             if a.dry_run:
-                print("would report  %s (%s)" % (run["content"], "done" if ok else "failed"))
+                print("would report  %s (%s)" % (run["content"], outcome))
                 continue
             if todoist(token, "GET", "/tasks/" + task_id):
                 todoist(token, "POST", "/comments", {"task_id": task_id, "content": comment})
-                relabel(token, task_id, (label, label + "-running"), label + ("-done" if ok else "-failed"))
-            print("%s  %s" % ("done  " if ok else "failed", run["content"]))
+                # A usage limit isn't the task's fault: put it back in the queue for another account.
+                relabel(token, task_id, (label, label + "-running"),
+                        label if outcome == "limit" else label + "-" + outcome)
+            if outcome == "limit":
+                state["rest"][run.get("account", "default")] = time.time() + cfg["dispatch_rest_hours"] * 3600
+            print("%-6s  %s (account %s)" % (outcome, run["content"], run.get("account", "default")))
             del state["running"][task_id]
             save()
 
@@ -1347,17 +1411,24 @@ def dispatch_main(argv):
 
         def tags(t):
             return [l.lower() for l in t.get("labels", [])] + [m.lower() for m in tag_re.findall(t["content"])]
-        wanted = [t for t in tasks if lowered in tags(t) and not finished & set(tags(t))]
+        # Every task of the dispatch project is for an agent, labelled or not.
+        project_ids = {p["id"] for p in todoist_all(token, "/projects")
+                       if p["name"].lower() == (cfg["dispatch_project"] or "").lower()}
+        wanted = [t for t in tasks if (lowered in tags(t) or t.get("project_id") in project_ids)
+                  and not finished & set(tags(t))]
         if not wanted:
             seen = sorted({l for t in tasks for l in tags(t)})
-            print("no open task labelled @%s among %d open tasks (labels seen: %s)" % (
-                label, len(tasks), ", ".join("@" + l for l in seen) or "none"))
+            print("no open task labelled @%s%s among %d open tasks (labels seen: %s)" % (
+                label, " or in project %s" % cfg["dispatch_project"] if project_ids else "", len(tasks),
+                ", ".join("@" + l for l in seen) or "none"))
         for task in wanted:
             if task["id"] in state["running"]:
                 continue
             hosts = [l for l in tags(task) if l in nodes]
             name = hosts[0] if hosts else me
+            pinned = [acc for acc in accounts if acc.lower() in tags(task)]
             title = tag_re.sub(lambda m: "" if m.group(1).lower() in nodes or m.group(1).lower() == lowered
+                               or m.group(1).lower() in (acc.lower() for acc in accounts)
                                else m.group(0), task["content"])
             title = re.sub(r"\s+", " ", title).strip()
             folder = "~"
@@ -1369,32 +1440,48 @@ def dispatch_main(argv):
                     folder = m.group(1)
                 elif line.strip() or lines:
                     lines.append(line)
-            if len(state["running"]) >= cfg["dispatch_max"]:
-                print("waiting  %s (already %d agents running)" % (task["content"], cfg["dispatch_max"]))
+            # The least busy account logged in on that host, not resting after a usage limit.
+            n, is_self = nodes[name]
+            if name not in logged_in:
+                found = launcher(n, cfg, is_self, ["accounts"] + list(accounts.values()))
+                logged_in[name] = {acc for acc, d in accounts.items() if found.get(d)}
+            busy = {}
+            for run in state["running"].values():
+                busy[run.get("account", "default")] = busy.get(run.get("account", "default"), 0) + 1
+            free = [acc for acc in (pinned or accounts) if acc in logged_in[name]
+                    and state["rest"].get(acc, 0) <= time.time() and busy.get(acc, 0) < cfg["dispatch_max"]]
+            if not free:
+                print("waiting  %s (no free account on %s: %s)" % (title, name, ", ".join(
+                    "%s %s" % (acc, "not logged in" if acc not in logged_in[name] else "resting"
+                               if state["rest"].get(acc, 0) > time.time() else "busy")
+                    for acc in (pinned or accounts))))
                 continue
+            account = min(free, key=lambda acc: busy.get(acc, 0))
             if a.dry_run:
-                print("would start  [%s] %s: %s" % (name, folder, title))
+                print("would start  [%s %s] %s: %s" % (name, account, folder, title))
+                busy[account] = busy.get(account, 0) + 1
+                state["running"]["dry-%s" % task["id"]] = {"account": account}
                 continue
             sid = str(uuid.uuid4())
             prompt = "\n\n".join(x for x in [title, "\n".join(lines).strip()] if x)
-            n, is_self = nodes[name]
-            started = launcher(n, cfg, is_self, ["start", sid, folder,
+            started = launcher(n, cfg, is_self, ["start", sid, folder, accounts[account],
                                                  base64.b64encode(("todo: " + title)[:80].encode()).decode(),
                                                  base64.b64encode(prompt.encode()).decode()])
             if "error" in started:
                 print("%s: ERROR: %s (%s)" % (n["name"], started["error"], task["content"]), file=sys.stderr)
                 continue
             state["running"][task["id"]] = {"node": n["name"], "sid": sid, "pid": started["pid"], "dir": folder,
-                                            "content": title, "started": time.strftime("%m-%d %H:%M")}
+                                            "content": title, "started": time.strftime("%m-%d %H:%M"),
+                                            "account": account, "config": accounts[account]}
             save()
             todoist(token, "POST", "/comments", {"task_id": task["id"], "content":
-                    "Agent started on %s in %s%s (session %s)." % (
-                        n["name"], folder, " (folder created)" if started.get("created") else "", sid)})
+                    "Agent started on %s with account %s in %s%s (session %s)." % (
+                        n["name"], account, folder, " (folder created)" if started.get("created") else "", sid)})
             relabel(token, task["id"], (label,), label + "-running")
-            print("started  [%s] %s: %s" % (n["name"], folder, title))
+            print("started  [%s %s] %s: %s" % (n["name"], account, folder, title))
     except TodoistError as exc:
         sys.exit("tailmon: Todoist: %s" % exc)
-    print("%d agent(s) running" % len(state["running"]))
+    print("%d agent(s) running" % len([k for k in state["running"] if not k.startswith("dry-")]))
 
 
 # ---------------------------------------------------------------------------------------------

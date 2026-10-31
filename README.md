@@ -194,10 +194,11 @@ timer.
 ```sh
 ./tailmon.py dispatch --dry-run   # which @claude tasks would start, and where
 ./tailmon.py dispatch             # start agents, post the reports of those that stopped
-./tailmon.py dispatch --status    # agents still running
+./tailmon.py dispatch --status    # agents still running, and accounts resting after a usage limit
+./tailmon.py dispatch --accounts  # which Claude accounts are logged in on each host
 ```
 
-Give a Todoist task the label `@claude` and run `tailmon dispatch` (by hand, or every few minutes from cron).
+Give a Todoist task the label `@claude`, or put it in the project `Claude-Tasks`, and run `tailmon dispatch` (by hand, or every few minutes from cron).
 It starts `claude -p` on a host, detached, with the task title and description as the request:
 
 - **Labels:** real Todoist labels or `@words` typed in the title (`@claude @asus Fix the plots`) both count,
@@ -213,8 +214,28 @@ It starts `claude -p` on a host, detached, with the task title and description a
 - **When it stops:** the next run posts its final reply as a comment, with the cost and the command to resume
   the session, and sets the label to `@claude-done` (or `@claude-failed`). You read it and close the task.
 
-At most `dispatch_max` agents run at once (default 3); the others wait for the next run. To run a task
-again, remove its `@claude-done` or `@claude-failed` label.
+At most `dispatch_max` agents run at once per account (default 3); the others wait for the next run. To run
+a task again, remove its `@claude-done` or `@claude-failed` label.
+
+#### Several Claude accounts
+
+Claude Code keeps each login in its own config directory, chosen with `CLAUDE_CONFIG_DIR`. List your
+accounts in the config, then log each one in once on every host that should use it:
+
+```json
+{"claude_accounts": {"seat2": "~/.claude-seat2", "seat3": "~/.claude-seat3"}}
+```
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-seat2 claude      # then /login with that account
+tailmon dispatch --accounts                   # check: "ok" where it is logged in
+```
+
+`~/.claude` is always an account too, named `default` unless you name it in the list. Each task goes to the
+least busy account logged in on its host; a label with an account name (`@seat2`) pins it. When an agent
+hits its usage limit, the task goes back in the queue (label `@claude` again) and that account is left alone
+for `dispatch_rest_hours` (default 1). `claude` and `todo` read the sessions of every account, and resume
+hints include the `CLAUDE_CONFIG_DIR` they need.
 
 ## Configuration
 
@@ -229,7 +250,9 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
   "claude_exclude": ["Downloads"],
   "todoist_token": "0123abcd...",
   "todoist_project": "Claude sessions",
+  "claude_accounts": {"seat2": "~/.claude-seat2"},
   "dispatch_label": "claude",
+  "dispatch_project": "Claude-Tasks",
   "dispatch_max": 3,
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
@@ -245,8 +268,11 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `claude_exclude`   | For `claude`: regular expressions; sessions whose folder or first request matches are hidden |
 | `todoist_token`    | For `todo`: Todoist API token (default `null`: use `TODOIST_API_TOKEN`)                  |
 | `todoist_project`  | For `todo`: Todoist project the tasks go to, created if missing (default `Claude sessions`) |
+| `claude_accounts`  | Claude accounts: name → config dir (`CLAUDE_CONFIG_DIR`); `~/.claude` is always included |
 | `dispatch_label`   | For `dispatch`: label that hands a task to an agent (default `claude`)                  |
-| `dispatch_max`     | For `dispatch`: agents running at once (default 3)                                       |
+| `dispatch_project` | For `dispatch`: project whose tasks all go to agents, labelled or not (default `Claude-Tasks`) |
+| `dispatch_max`     | For `dispatch`: agents running at once, per account (default 3)                          |
+| `dispatch_rest_hours` | For `dispatch`: hours an account is skipped after hitting its usage limit (default 1) |
 | `sample_seconds`   | Measurement window for rates (CPU %, disk / network throughput) in snapshot mode         |
 | `discover_seconds` | In watch mode, how often to re-run `tailscale status` to find new or departed hosts      |
 

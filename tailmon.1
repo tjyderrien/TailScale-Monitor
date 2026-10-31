@@ -81,6 +81,7 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .B tailmon dispatch
 .RB [ \-\-dry\-run ]
 .RB [ \-\-status ]
+.RB [ \-\-accounts ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -331,7 +332,9 @@ As for
 Start an unattended Claude Code agent
 .RB ( "claude \-p" ,
 detached) for every open Todoist task labelled
-.BR @claude ,
+.B @claude
+or in the project
+.BR Claude\-Tasks ,
 with the task title and description as the request. Words such as
 .B @claude
 typed in the title count as labels. Another label naming a Tailscale host picks the
@@ -347,6 +350,11 @@ stopped is posted as a comment, with the command to resume its session, and the 
 .B @claude\-done
 or
 .BR @claude\-failed .
+With several Claude accounts
+.RB ( claude_accounts ),
+each task goes to the least busy account logged in on its host, or to the one named by a label; an agent
+that hits its usage limit puts the task back in the queue and rests its account for
+.B dispatch_rest_hours.
 Closing the task is left to you; to run it again, remove the
 .B @claude\-done
 or
@@ -359,7 +367,13 @@ agents run at once.
 Show which tasks would start and which reports would be posted.
 .TP
 .B \-\-status
-List the agents still running.
+List the agents still running and the accounts resting after a usage limit.
+.TP
+.B \-\-accounts
+Show which Claude accounts are logged in on each host. Log one in with
+.BR "CLAUDE_CONFIG_DIR=" \fIdir\fP " claude"
+and
+.BR /login .
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -422,7 +436,9 @@ overrides any of the built\-in defaults:
   "claude_exclude": ["Downloads"],
   "todoist_token": "0123abcd...",
   "todoist_project": "Claude sessions",
+  "claude_accounts": {"seat2": "~/.claude\-seat2"},
   "dispatch_label": "claude",
+  "dispatch_project": "Claude\-Tasks",
   "dispatch_max": 3,
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
@@ -471,16 +487,40 @@ For
 the Todoist project for the tasks, created if missing. Default
 .BR "Claude sessions" .
 .TP
+.B claude_accounts
+Claude accounts, as name \(-> config directory (used as
+.BR CLAUDE_CONFIG_DIR );
+.I ~/.claude
+is always included, as
+.B default
+unless named here.
+.BR claude ,
+.B todo
+and
+.B dispatch
+use every account.
+.TP
 .B dispatch_label
 For
 .BR dispatch :
 the label that hands a task to an agent. Default
 .BR claude .
 .TP
+.B dispatch_project
+For
+.BR dispatch :
+the project whose tasks all go to agents, labelled or not. Default
+.BR Claude\-Tasks .
+.TP
 .B dispatch_max
 For
 .BR dispatch :
-how many agents may run at once. Default 3.
+how many agents may run at once per account. Default 3.
+.TP
+.B dispatch_rest_hours
+For
+.BR dispatch :
+hours an account is skipped after one of its agents hit the usage limit. Default 1.
 .TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
