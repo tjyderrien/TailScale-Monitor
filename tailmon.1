@@ -58,30 +58,8 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-json ]
 .br
 .B tailmon claude
-.RB [ \-\-days
-.IR N ]
-.RB [ \-\-all ]
-.RB [ \-\-by
-.IR method | state | host ]
-.RB [ \-\-markdown
-.IR FILE ]
-.RB [ \-\-hosts
-.IR LIST ]
-.RB [ \-\-json ]
-.br
-.B tailmon todo
-.RB [ \-\-dry\-run ]
-.RB [ \-\-score ]
-.RB [ \-\-log ]
-.RB [ \-\-days
-.IR N ]
-.RB [ \-\-hosts
-.IR LIST ]
-.br
-.B tailmon dispatch
-.RB [ \-\-dry\-run ]
-.RB [ \-\-status ]
-.RB [ \-\-accounts ]
+.RI | todo | dispatch
+.RI [ ARGS ...]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -268,112 +246,25 @@ Only these comma\-separated Tailscale hostnames.
 Print
 .B {"results": [...], "skipped": [...]}
 instead of text.
-.SS "claude"
-List the Claude Code sessions found in
-.I ~/.claude
-on every online Linux peer and the local machine, and group the unfinished ones by how to finish them:
-run a command yourself, commit or push git, answer the session, restart the task in a new session,
-wait for a running session, or close an idle one. Grouping relies on keywords in each session\(aqs last
-reply. When a task was resumed in several sessions, only the most recent is shown. Each host has
-180 seconds to answer.
-.TP
-.BI \-\-days " N"
-Only sessions active in the last
-.I N
-days. Default 60.
-.TP
-.B \-\-all
-Also list finished sessions.
-.TP
-.BI \-\-by " method\fR|\fPstate\fR|\fPhost"
-Group by how to finish the session (default), by session state, or by host.
-.TP
-.BI \-\-markdown " FILE"
-Also write the report as Markdown to
-.IR FILE .
-.TP
-.BI \-\-hosts " LIST"
-Only these comma\-separated Tailscale hostnames.
-.TP
-.B \-\-json
-Print
-.B {"sessions": [...], "errors": [...], "skipped": [...]}
-instead of the report.
-.SS "todo"
-Add a Todoist task for every session that
-.B claude
-lists as pending (running sessions excepted), in the project named by
-.BR todoist_project .
-A task ticked off in Todoist earns its points; so does a task whose session no longer needs anything,
-which is then closed. A task deleted in Todoist earns nothing and is not added again; one whose session got
-older than
-.B \-\-days
-is closed without points. Tasks of hosts that could not be reached are left alone.
-Points: 10 to run a command or commit/push, 15 to answer, 25 to restart a task, 5 to close an idle session.
-Every 100 points is a level; the streak counts consecutive days with a finished task.
-Needs a Todoist API token in
-.B TODOIST_API_TOKEN
-or
-.BR todoist_token .
-.TP
-.B \-\-dry\-run
-Show what would be added or closed, without contacting Todoist.
-.TP
-.B \-\-score
-Only print points, level and streak.
-.TP
-.B \-\-log
-List every finished task with its points, then the score.
-.TP
-.BI \-\-days " N\fR, \fP" \-\-hosts " LIST"
-As for
-.BR claude .
-.SS "dispatch"
-Start an unattended Claude Code agent
-.RB ( "claude \-p" ,
-detached) for every open Todoist task labelled
-.B @claude
-or in the project
-.BR Claude\-Tasks ,
-with the task title and description as the request. Words such as
-.B @claude
-typed in the title count as labels. Another label naming a Tailscale host picks the
-machine (default: this one); a description line
-.B dir:
-.IR path ,
-or a description that starts with a path, picks the folder (created if missing; default: home). The agent may read and edit files but has no shell
-.RB ( "\-\-permission\-mode acceptEdits \-\-disallowedTools Bash" ).
-The label becomes
-.B @claude\-running
-and a comment gives the host, folder and session ID. On a later run, the final reply of each agent that
-stopped is posted as a comment, with the command to resume its session, and the label becomes
-.B @claude\-done
-or
-.BR @claude\-failed .
-With several Claude accounts
-.RB ( claude_accounts ),
-each task goes to the least busy account logged in on its host, or to the one named by a label; an agent
-that hits its usage limit puts the task back in the queue and rests its account for
-.B dispatch_rest_hours.
-Closing the task is left to you; to run it again, remove the
-.B @claude\-done
-or
-.B @claude\-failed
-label. At most
-.B dispatch_max
-agents run at once.
-.TP
-.B \-\-dry\-run
-Show which tasks would start and which reports would be posted.
-.TP
-.B \-\-status
-List the agents still running and the accounts resting after a usage limit.
-.TP
-.B \-\-accounts
-Show which Claude accounts are logged in on each host. Log one in with
-.BR "CLAUDE_CONFIG_DIR=" \fIdir\fP " claude"
+.SS "claude, todo, dispatch"
+Run ClaudeExplorer
+.RB ( claude\-explorer ),
+which now holds these commands, with the same arguments:
+.B tailmon claude
+runs
+.BR claude\-explorer ,
+.B tailmon todo
+runs
+.BR "claude\-explorer todo" ,
 and
-.BR /login .
+.B tailmon dispatch
+runs
+.BR "claude\-explorer dispatch" .
+The program is looked up on the
+.B PATH
+unless
+.B claude_explorer
+is set. See https://github.com/tjyderrien/ClaudeXplorer.
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -433,13 +324,6 @@ overrides any of the built\-in defaults:
   "default_user": "admin",
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer\-pi"],
-  "claude_exclude": ["Downloads"],
-  "todoist_token": "0123abcd...",
-  "todoist_project": "Claude sessions",
-  "claude_accounts": {"seat2": "~/.claude\-seat2"},
-  "dispatch_label": "claude",
-  "dispatch_project": "Claude\-Tasks",
-  "dispatch_max": 3,
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -468,59 +352,17 @@ your usual keys or agent.
 .B exclude
 Tailscale hostnames never to probe or search.
 .TP
-.B claude_exclude
-For
-.BR claude :
-regular expressions; sessions whose folder or first request matches one are hidden.
-.TP
-.B todoist_token
-For
-.BR todo :
-Todoist API token. Default
-.BR null :
-use
-.BR TODOIST_API_TOKEN .
-.TP
-.B todoist_project
-For
-.BR todo :
-the Todoist project for the tasks, created if missing. Default
-.BR "Claude sessions" .
-.TP
-.B claude_accounts
-Claude accounts, as name \(-> config directory (used as
-.BR CLAUDE_CONFIG_DIR );
-.I ~/.claude
-is always included, as
-.B default
-unless named here.
+.B claude_explorer
+Program run by
 .BR claude ,
 .B todo
 and
-.B dispatch
-use every account.
-.TP
-.B dispatch_label
-For
-.BR dispatch :
-the label that hands a task to an agent. Default
-.BR claude .
-.TP
-.B dispatch_project
-For
-.BR dispatch :
-the project whose tasks all go to agents, labelled or not. Default
-.BR Claude\-Tasks .
-.TP
-.B dispatch_max
-For
-.BR dispatch :
-how many agents may run at once per account. Default 3.
-.TP
-.B dispatch_rest_hours
-For
-.BR dispatch :
-hours an account is skipped after one of its agents hit the usage limit. Default 1.
+.BR dispatch .
+Default
+.BR null :
+.B claude\-explorer
+on the
+.BR PATH .
 .TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
@@ -552,27 +394,10 @@ so key\-based, non\-interactive access is required.
 .TP
 .B NO_COLOR
 If set, disable colors.
-.TP
-.B TODOIST_API_TOKEN
-Todoist API token for
-.B todo
-and
-.BR dispatch .
 .SH FILES
 .TP
 .I ~/.config/tailmon.json
 Optional configuration file.
-.TP
-.I ~/.local/state/tailmon/todo.json
-Points, history and open tasks of
-.BR todo .
-.TP
-.I ~/.local/state/tailmon/dispatch.json
-Agents started by
-.BR dispatch ;
-their output is in
-.I ~/.local/state/tailmon/agents/
-on the host that runs them.
 .TP
 .I ~/.ssh/config
 Per\-host SSH settings, honored as described above.
@@ -628,13 +453,8 @@ Mount the root filesystem of every peer at
 Unmount them again.
 .TP
 .B tailmon claude \-\-by host
-Claude Code sessions on every host, one table per machine.
-.TP
-.B tailmon todo
-Sync them to Todoist and show your points.
-.TP
-.B tailmon dispatch
-Start agents for the Todoist tasks labelled @claude.
+Claude Code sessions on every host, one table per machine (runs
+.BR claude\-explorer ).
 .SH SEE ALSO
 .BR tailscale (1),
 .BR ssh (1),

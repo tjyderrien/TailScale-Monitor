@@ -27,10 +27,9 @@ server-1         64 cores  load 0.10 0.07 0.07
 - **Tailnet mounts.** `mount` puts every online Linux peer's filesystem under `/media/tailscale/<host>` with
   `sshfs`, so ordinary programs (image viewers, scripts, …) can open files from all machines at once,
   with the same path layout on every host.
-- **Claude Code sessions.** `claude` lists the [Claude Code](https://claude.com/claude-code) sessions on every
-  host and groups the unfinished ones by what you have to do to finish them. `todo` turns them into
-  [Todoist](https://todoist.com) tasks and gives you points for finishing them. `dispatch` goes the other way:
-  Todoist tasks labelled `@claude` are handed to unattended Claude Code agents on the tailnet.
+- **Claude Code sessions.** `claude`, `todo` and `dispatch` run
+  [ClaudeExplorer](https://github.com/tjyderrien/ClaudeXplorer), which triages Claude Code sessions across the
+  tailnet and hands Todoist tasks to agents.
 
 ## Requirements
 
@@ -131,111 +130,15 @@ Don't run it with `sudo`: it must use your own SSH keys and user.
 
 ### Claude Code sessions
 
-```sh
-./tailmon.py claude                         # open sessions of the last 60 days, grouped by what to do
-./tailmon.py claude --by host               # one table per machine
-./tailmon.py claude --by state              # grouped by session state
-./tailmon.py claude --all --days 14         # include finished sessions, last 14 days
-./tailmon.py claude --markdown report.md    # also write the report as Markdown
-./tailmon.py claude --json                  # raw session data
-```
-
-Each host's `~/.claude` is read over the same SSH connection as the other commands, and the sessions are
-sorted into:
-
-| Group                             | Meaning                                                                         |
-|-----------------------------------|---------------------------------------------------------------------------------|
-| Run a command yourself            | The session asked you to run something (often `sudo` or `ssh-add`). The command is shown. |
-| Commit / push git                 | Work is finished but the folder has uncommitted changes or unpushed commits.    |
-| Answer the session                | The session ended on a question.                                                |
-| Restart the task in a new session | Cut off by a usage limit, stopped mid-task, or promised to report back and never did. The last request is shown. |
-| Running, just wait                | The session is working right now.                                               |
-| Idle, can be closed               | The session is still open but has nothing pending.                              |
-| Done                              | Shown only with `--all`.                                                        |
-
-To pick a session back up, go to its folder on that machine and run `claude --resume`. Grouping relies on
-keywords in each session's last reply, so a few sessions land in the wrong group. When a task was resumed in
-several sessions, only the most recent is shown.
-
-### Todoist tasks and points
+`tailmon claude`, `tailmon todo` and `tailmon dispatch` are now part of
+[ClaudeExplorer](https://github.com/tjyderrien/ClaudeXplorer). With `claude-explorer` on the PATH (or its path
+in `"claude_explorer"` in the config), these commands run it with the same arguments:
 
 ```sh
-export TODOIST_API_TOKEN=...      # Todoist > Settings > Integrations > Developer
-./tailmon.py todo --dry-run       # what would be added or closed
-./tailmon.py todo                 # sync: one task per pending session, in the "Claude sessions" project
-./tailmon.py todo --score         # points, level and streak, without syncing
-./tailmon.py todo --log           # every finished task and what it earned
+tailmon claude --by host      # = claude-explorer --by host
+tailmon todo --score          # = claude-explorer todo --score
+tailmon dispatch --status     # = claude-explorer dispatch --status
 ```
-
-Each run adds a task for every session `claude` lists as pending (except running ones) and checks the
-existing tasks:
-
-- ticked off in Todoist: you earn its points;
-- the session no longer needs anything (you pushed, answered, …) but the task is still open: the task is
-  closed and you earn its points too;
-- deleted in Todoist: no points, and it isn't added again;
-- the session got older than `--days`: closed, no points.
-
-| Task                 | Points |
-|----------------------|-------:|
-| Run a command        | 10     |
-| Commit / push git    | 10     |
-| Answer the session   | 15     |
-| Restart the task     | 25     |
-| Close an idle session| 5      |
-
-Every 100 points is a level; the streak counts consecutive days with at least one finished task. Hosts that
-are offline or unreachable are left alone, so their tasks don't count as finished. Points and the task list
-are kept in `~/.local/state/tailmon/todo.json`. To sync regularly, run `tailmon todo` from cron or a systemd
-timer.
-
-### Todoist tasks done by agents
-
-```sh
-./tailmon.py dispatch --dry-run   # which @claude tasks would start, and where
-./tailmon.py dispatch             # start agents, post the reports of those that stopped
-./tailmon.py dispatch --status    # agents still running, and accounts resting after a usage limit
-./tailmon.py dispatch --accounts  # which Claude accounts are logged in on each host
-```
-
-Give a Todoist task the label `@claude`, or put it in the project `Claude-Tasks`, and run `tailmon dispatch` (by hand, or every few minutes from cron).
-It starts `claude -p` on a host, detached, with the task title and description as the request:
-
-- **Labels:** real Todoist labels or `@words` typed in the title (`@claude @asus Fix the plots`) both count,
-  in any case.
-- **Where:** a second label naming a Tailscale host (`@asus`) picks the machine, otherwise the local one. A
-  line `dir: ~/Documents/project` in the description, or a description that starts with a path, picks the
-  folder (created if missing), otherwise the home directory. The host needs Claude Code installed and
-  logged in.
-- **What it may do:** read and edit files (`--permission-mode acceptEdits`). It has no shell
-  (`--disallowedTools Bash`): when the task needs a command or a decision, it says so in its report.
-- **While it runs:** the label becomes `@claude-running`, and a comment gives the host, folder and session ID.
-  `tailmon claude` shows the session like any other.
-- **When it stops:** the next run posts its final reply as a comment, with the cost and the command to resume
-  the session, and sets the label to `@claude-done` (or `@claude-failed`). You read it and close the task.
-
-At most `dispatch_max` agents run at once per account (default 3); the others wait for the next run. To run
-a task again, remove its `@claude-done` or `@claude-failed` label.
-
-#### Several Claude accounts
-
-Claude Code keeps each login in its own config directory, chosen with `CLAUDE_CONFIG_DIR`. List your
-accounts in the config, then log each one in once on every host that should use it:
-
-```json
-{"claude_accounts": {"seat2": "~/.claude-seat2", "seat3": "~/.claude-seat3"}}
-```
-
-```sh
-CLAUDE_CONFIG_DIR=~/.claude-seat2 claude      # then /login with that account
-tailmon dispatch --accounts                   # check: "ok" where it is logged in
-```
-
-`~/.claude` is always an account too, named `default` unless you name it in the list. Each task goes to the
-least busy account logged in on its host; a label with an account name (`@seat2`) pins it. When an agent
-hits its usage limit, the task goes back in the queue (label `@claude` again) and that account is left alone
-for `dispatch_rest_hours` (default 1). `claude` and `todo` read the sessions of every account, and resume
-hints include the `CLAUDE_CONFIG_DIR` they need.
 
 ## Configuration
 
@@ -247,13 +150,6 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
   "default_user": "admin",
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer-pi"],
-  "claude_exclude": ["Downloads"],
-  "todoist_token": "0123abcd...",
-  "todoist_project": "Claude sessions",
-  "claude_accounts": {"seat2": "~/.claude-seat2"},
-  "dispatch_label": "claude",
-  "dispatch_project": "Claude-Tasks",
-  "dispatch_max": 3,
   "sample_seconds": 1.0,
   "discover_seconds": 30.0
 }
@@ -265,14 +161,7 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `default_user`     | SSH user for hosts not listed in `users` (default `null`: your `~/.ssh/config` / local username) |
 | `identity`         | SSH private key passed with `-i` (default `null`: your usual SSH keys / agent)           |
 | `exclude`          | Tailscale hostnames never to probe                                                       |
-| `claude_exclude`   | For `claude`: regular expressions; sessions whose folder or first request matches are hidden |
-| `todoist_token`    | For `todo`: Todoist API token (default `null`: use `TODOIST_API_TOKEN`)                  |
-| `todoist_project`  | For `todo`: Todoist project the tasks go to, created if missing (default `Claude sessions`) |
-| `claude_accounts`  | Claude accounts: name → config dir (`CLAUDE_CONFIG_DIR`); `~/.claude` is always included |
-| `dispatch_label`   | For `dispatch`: label that hands a task to an agent (default `claude`)                  |
-| `dispatch_project` | For `dispatch`: project whose tasks all go to agents, labelled or not (default `Claude-Tasks`) |
-| `dispatch_max`     | For `dispatch`: agents running at once, per account (default 3)                          |
-| `dispatch_rest_hours` | For `dispatch`: hours an account is skipped after hitting its usage limit (default 1) |
+| `claude_explorer`  | Program run by `claude`, `todo` and `dispatch` (default `null`: `claude-explorer` on the PATH) |
 | `sample_seconds`   | Measurement window for rates (CPU %, disk / network throughput) in snapshot mode         |
 | `discover_seconds` | In watch mode, how often to re-run `tailscale status` to find new or departed hosts      |
 
