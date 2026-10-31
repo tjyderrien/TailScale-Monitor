@@ -99,20 +99,35 @@ tailmon umount                                    # unmount everything under /me
 `search` and `grep` use the same SSH configuration as monitoring. They skip hidden files, `/proc` and
 sshfs mounts below the root (peers under `/media/tailscale` can mount each other in a loop; `--boom`
 lifts this guard) by default, limit output to 1,000 results, and only search online Linux peers. Use
-`--hidden`, `--proc`, `--boom`, `--max-results N`, `--hosts host1,host2`, and `--json` as needed. `grep`
+`--hidden`, `--proc`, `--boom`, `--max-results N`, `--hosts host1,host2`, `--exclude host3`, and `--json`
+as needed (`--exclude biatri-1` leaves out a host whose huge disks would make everyone wait; the `exclude`
+config key does it for good). `grep`
 uses Python regular expressions; use `--fixed-strings` for literal text.
 
 Each host gets 300 seconds (`--timeout SEC`, `0` for no limit); a host that runs out of time keeps what
 it found so far, and the error says which path it was reading. `-v` prints a per-host summary (matches,
-time, directories and files walked, depth reached below the root) on stderr. `-vv` also shows a live
-progress bar per host with the current depth / deepest so far and the path being searched, redrawn in
-place without scrolling. It costs a little extra traffic: each host sends its position twice a second,
-only when it changed, which also shows where a slow disk is stuck:
+time, walk rate, directories and files walked, depth reached below the root) on stderr. `-vv` also shows a
+live progress bar per host with the walk rate, the current depth / deepest so far and the path being
+searched, redrawn in place without scrolling. It costs a little extra traffic: each host sends its
+position twice a second, only when it changed, which also shows where a slow disk is stuck:
 
 ```
-asus             ████████████████████ 100%    699 found    1.5s  done: 5366 dirs, 28871 files, depth 9
-luzicka          ██████··············  31%  49954 found   56.7s  depth  4/11  …/Bibliography/EPJ Applied Physics/1998
+asus             ████████████████████ 100%    699 found    1.5s   22.8k/s  done: 5366 dirs, 28871 files, depth 9
+luzicka          ██████··············  31%  49954 found   56.7s    3.1k/s  depth  4/11  …/Bibliography/EPJ Applied Physics/1998
 ```
+
+The walk rate (directories plus files per second) shows where searching is fast. Walking a tree is
+bound by latency, not bandwidth: each directory listing is a round trip, so a host reads its own disks
+far faster than another host can read them through sshfs, even on a fast LAN. Walking the same tree,
+with warm caches on the host holding it:
+
+| Tree on (link to this PC)    | walked by that host | walked here through sshfs |
+|------------------------------|---------------------|---------------------------|
+| asus (internet, ~20 ms)      | 165k/s              | 0.3k/s (~550× slower)     |
+| biatri-1 (LAN, 0.3 ms)       | 165k/s              | 2.4k–10.5k/s (16–70× slower) |
+
+This is why `search` and `grep` skip sshfs mounts by default: each peer searches its own drives and only
+the matches cross the network.
 
 `mount` makes the whole tailnet look like one directory tree, so any local tool works on it:
 

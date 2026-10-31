@@ -18,6 +18,8 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .IR GLOB ]
 .RB [ \-\-hosts
 .IR LIST ]
+.RB [ \-\-exclude
+.IR LIST ]
 .RB [ \-\-max\-results
 .IR N ]
 .RB [ \-\-hidden ]
@@ -34,6 +36,8 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-i ]
 .RB [ \-\-fixed\-strings ]
 .RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-exclude
 .IR LIST ]
 .RB [ \-\-max\-results
 .IR N ]
@@ -171,6 +175,13 @@ as literal text rather than a regular expression.
 .BI \-\-hosts " LIST"
 Only search these comma\-separated Tailscale hostnames.
 .TP
+.BI \-\-exclude " LIST"
+Do not search these comma\-separated Tailscale hostnames (this machine included, if named),
+e.g. a host whose large disks would make the whole search wait. To leave a host out of every
+command for good, use the
+.B exclude
+configuration key instead.
+.TP
 .BI \-\-max\-results " N"
 Stop after
 .I N
@@ -219,7 +230,9 @@ means no limit. Default: 300.
 .TP
 .BR \-v ", " \-\-verbose
 Once: after the search, print one line per host on standard error with the number of matches,
-the time taken, the directories and files walked and the depth reached (the deepest directory level
+the time taken, the walk rate (directories plus files read per second, e.g.
+.BR 12.3k/s ),
+the directories and files walked and the depth reached (the deepest directory level
 below the root, which is 0) (also added as
 .B stats
 to the
@@ -228,7 +241,7 @@ output).
 Twice
 .RB ( \-vv ):
 while searching, also show one line per host on standard error, redrawn in place, with a progress
-bar, the number of matches, the elapsed time, the current depth and the deepest reached so far
+bar, the number of matches, the elapsed time, the walk rate so far, the current depth and the deepest reached so far
 (e.g.
 .BR "depth 3/7" )
 and the directory (for grep: the file) being read;

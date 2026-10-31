@@ -411,14 +411,14 @@ def probe(node, cfg, is_self):
     return json.loads(r.stdout)
 
 
-def targets_for(cfg, only=None):
-    """Return ([(node, is_self)], [skipped nodes])."""
+def targets_for(cfg, only=None, exclude=()):
+    """Return ([(node, is_self)], [skipped nodes]); `exclude` also drops this machine if it is named."""
     me, peers = discover()
-    targets, skipped = [(me, True)], []
+    targets, skipped = ([] if me["name"] in exclude else [(me, True)]), []
     for p in peers:
         if only and p["name"] not in only:
             continue
-        if p["name"] in cfg["exclude"]:
+        if p["name"] in cfg["exclude"] or p["name"] in exclude:
             continue
         if p["os"] != "linux" or not p["online"]:
             skipped.append(p)
@@ -439,6 +439,14 @@ def collect(cfg, only=None):
 
 FILE_TIMEOUT = 300.0  # seconds per host for search/grep; big multi-disk trees need a while
 PROGRESS_SECONDS = 0.5  # how often a host reports its position with -vv (only when it changed)
+
+
+def walk_rate(dirs, files, seconds):
+    """Directories plus files walked per second, e.g. '12.3k/s': compares how fast hosts (or paths) are read."""
+    if not seconds or dirs is None:
+        return "   -  /s"
+    rate = (dirs + (files or 0)) / seconds
+    return ("%5.1fk/s" % (rate / 1000)) if rate >= 1000 else ("%6d/s" % rate)
 
 
 def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed, progress,
@@ -517,8 +525,10 @@ class FileJob:
         frac = 1.0 if self.finished else (self.progress or {}).get("frac", 0.0)
         filled = int(frac * 20)
         p = self.progress or {}
-        head = "%s %s %3d%%  %5d found  %5.1fs  " % (
-            name, "█" * filled + "·" * (20 - filled), 100 * frac, found, elapsed)
+        d = self.done or p
+        head = "%s %s %3d%%  %5d found  %5.1fs  %s  " % (
+            name, "█" * filled + "·" * (20 - filled), 100 * frac, found, elapsed,
+            walk_rate(d.get("dirs"), d.get("files"), elapsed))
         if not self.finished:
             head += "depth %2d/%-2d  " % (p.get("depth", 0), p.get("max_depth", 0))
         if self.finished:
@@ -558,8 +568,8 @@ class ProgressBoard:
 
 
 def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=False, fixed=False,
-              verbose=0, timeout=0, proc=False, boom=False):
-    targets, skipped = targets_for(cfg, only)
+              verbose=0, timeout=0, proc=False, boom=False, exclude=()):
+    targets, skipped = targets_for(cfg, only, exclude)
     jobs = [FileJob(n) for n, _ in targets]
     board = ProgressBoard(jobs) if verbose >= 2 and sys.stderr.isatty() else None
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
@@ -611,7 +621,9 @@ def render_file_results(operation, rows, errors, skipped, stats, as_json, verbos
         for s in sorted(stats, key=lambda s: s["node"]):
             walked = ("  %d dirs, %d files, depth %d" % (s["dirs"], s["files"], s["max_depth"])
                       if s["dirs"] is not None else "")
-            print("%-16s %5d found  %6.1fs%s" % (s["node"], s["found"], s["seconds"], walked), file=sys.stderr)
+            print("%-16s %5d found  %6.1fs  %s%s" % (s["node"], s["found"], s["seconds"],
+                                                     walk_rate(s["dirs"], s["files"], s["seconds"]), walked),
+                  file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1016,6 +1028,9 @@ def file_main(argv):
 
     def common(parser):
         parser.add_argument("--hosts", help="comma-separated Tailscale hostnames to search")
+        parser.add_argument("--exclude", metavar="LIST",
+                            help="comma-separated Tailscale hostnames not to search, e.g. a host whose "
+                                 "huge disks would make everyone wait")
         parser.add_argument("--max-results", type=int, default=1000, metavar="N",
                             help="maximum results across all hosts")
         parser.add_argument("--hidden", action="store_true", help="include hidden files and directories")
@@ -1051,12 +1066,13 @@ def file_main(argv):
         ap.error("--max-results must be at least 1")
     cfg = load_config()
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    exclude = set(x for x in a.exclude.split(",") if x) if a.exclude else set()
     pattern = a.name if a.operation == "search" else a.pattern
     rows, errors, skipped, stats = file_tool(cfg, only, a.operation, a.path, pattern,
                                               a.max_results, a.hidden,
                                               getattr(a, "ignore_case", False),
                                               getattr(a, "fixed_strings", False),
-                                              a.verbose, a.timeout, a.proc, a.boom)
+                                              a.verbose, a.timeout, a.proc, a.boom, exclude)
     render_file_results(a.operation, rows, errors, skipped, stats, a.json, a.verbose)
 
 
