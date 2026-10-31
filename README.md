@@ -143,6 +143,41 @@ tailmon todo --score          # = claude-explorer todo --score
 tailmon dispatch --status     # = claude-explorer dispatch --status
 ```
 
+### How TailMon and ClaudeExplorer fit together
+
+Coupling matrix (design structure matrix): the same components label rows and columns, and
+**M<sub>ij</sub> = 1 when component i uses component j**.
+
+```
+                         TailMon │  ClaudeExplorer  │        external
+                          1   2  │   3    4    5    │  6   7   8   9  10
+                       ┌─────────┼──────────────────┼────────────────────
+ 1 TailMon monitor/fs  │  ■   ·  │   ·    ·    ·    │  ·   1   ·   1   ·
+ 2 TailMon forwarder   │  ·   ■  │   1    1    1    │  ·   ·   ·   1   ·
+                       ├─────────┼──────────────────┼────────────────────
+ 3 CE triage           │  ·   ·  │   ■    ·    ·    │  ·   1   ·   1   1
+ 4 CE todo             │  ·   ·  │   1    ■    ·    │  ·   1   1   1   1
+ 5 CE dispatch         │  ·   ·  │   ·    ·    ■    │  ·   1   1   1   1
+                       ├─────────┼──────────────────┼────────────────────
+ 6 cron 08:00          │  ·   1  │   ·    ·    ·    │  ■   ·   ·   ·   ·
+ 7 Tailscale + SSH     │  ·   ·  │   ·    ·    ·    │  ·   ■   ·   ·   ·
+ 8 Todoist             │  ·   ·  │   ·    ·    ·    │  ·   ·   ■   ·   ·
+ 9 tailmon.json        │  ·   ·  │   ·    ·    ·    │  ·   ·   ·   ■   ·
+10 claude-explorer.json│  ·   ·  │   ·    ·    ·    │  ·   ·   ·   ·   ■
+```
+
+1 is `tailmon` itself, `search`, `grep` and `mount`; 2 is `tailmon claude|todo|dispatch`, which runs
+`claude-explorer` with the same arguments; 3–5 are `claude-explorer`, `claude-explorer todo` and
+`claude-explorer dispatch` (CE = ClaudeExplorer); 6 is a cron line running `tailmon dispatch`.
+
+- **One-way coupling.** The TailMon → ClaudeExplorer block (rows 1–2, columns 3–5) holds only row 2, the
+  forwarder. The ClaudeExplorer → TailMon block (rows 3–5, columns 1–2) is empty: ClaudeExplorer never uses
+  TailMon.
+- **One shared resource,** column 9: both read `~/.config/tailmon.json` (it can hold the Todoist token).
+- **Inside ClaudeExplorer,** `todo` builds on the triage (M<sub>43</sub>); `dispatch` stands alone.
+- **Cron** reaches ClaudeExplorer through the forwarder (M<sub>62</sub>). Calling `claude-explorer dispatch`
+  directly moves that 1 to M<sub>65</sub>.
+
 ## Configuration
 
 Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in default:
