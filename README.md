@@ -84,12 +84,32 @@ tailmon -w 60 --log m.jsonl --quiet  # same, without drawing (for cron / systemd
 
 Colors are green / yellow / red at < 70 % / ≥ 70 % / ≥ 90 %. Set `NO_COLOR=1` to disable them.
 
+### Sound volume
+
+```sh
+tailmon volume                       # volume of every host
+tailmon volume 40                    # set every host to 40 %
+tailmon volume +5 --hosts asus       # step up (or -5 down) on one host
+tailmon volume mute --exclude luzicka   # also unmute, toggle
+tailmon serve                        # web page for the whole network: http://<this-pc>:8765/
+tailmon serve --bind 100.x.y.z --token s3cret   # tailnet only, and http://...:8765/?token=s3cret
+```
+
+Each host's default output is driven with `wpctl` (PipeWire), `pactl` (PulseAudio) or `amixer` (ALSA),
+whichever answers first, as the SSH user; nothing is installed remotely. The sound server must be running,
+i.e. someone logged into a desktop session as that user. `serve` shows a slider and a mute button per host
+and exposes a JSON API: `GET /api/volume` lists the hosts, `POST /api/volume/<host>` with
+`{"action": "set", "value": 40}` (or `up`, `down`, `mute`, `unmute`, `toggle`, `get`) changes one.
+It listens on every interface by default with no password: anyone who can reach the port can change the
+volume. Use `--token`, or `--bind` with this PC's Tailscale IP so only the tailnet can reach it.
+
 ### Files across the tailnet
 
 ```sh
 tailmon search /var/log --name '*.log'            # find matching files on every peer
 tailmon grep 'ERROR|WARN' /var/log -i             # grep file contents across the tailnet
 tailmon search /media --name '*.pdf' -vv --timeout 0  # live progress, no time limit
+tailmon search ~/Documents --name '*invoice*' -i     # case-insensitive: also Invoice.PDF
 tailmon grep --fixed-strings 'needle' /home --hosts server-1 --json
 tailmon mount                                     # every peer's / at /media/tailscale/<host>
 tailmon mount --path /data --hosts gpu-box,server-1
@@ -109,7 +129,6 @@ it found so far, and the error says which path it was reading. `-v` prints a per
 time, walk rate, directories and files walked, depth reached below the root) on stderr. `-vv` also shows a
 live progress bar per host with the walk rate, the current depth / deepest so far and the path being
 searched, redrawn in place without scrolling. It costs a little extra traffic: each host sends its
-tailmon search ~/Documents --name '*invoice*' -i     # case-insensitive: also Invoice.PDF
 position twice a second, only when it changed, which also shows where a slow disk is stuck:
 
 ```

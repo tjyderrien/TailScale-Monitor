@@ -261,6 +261,44 @@ network traffic. The display is only drawn when standard error is a terminal; th
 before the results are printed.
 .PP
 Per\-host errors and the list of hosts that were not searched are written to standard error.
+.SS "volume [LEVEL]"
+Show the sound volume of every host, or change it:
+.I LEVEL
+is a percentage
+.RB ( 40 ),
+a step
+.RB ( +5 ", " \-5 ),
+.BR mute ", " unmute " or " toggle .
+The default output is driven with
+.BR wpctl ", " pactl " or " amixer ,
+whichever works, so the user's sound server must be running.
+Takes
+.BR \-\-hosts ", " \-\-exclude " and " \-\-json .
+.SS "serve"
+Serve a web page with a volume slider and mute button per host, and a JSON API
+.RB ( "GET /api/volume" ,
+.B POST /api/volume/HOST
+with
+.BR "{\(dqaction\(dq: \(dqset\(dq, \(dqvalue\(dq: 40}" ).
+.TP
+.BI \-\-bind " ADDR"
+Address to listen on. Default:
+.BR 0.0.0.0 ,
+every interface, with no password; give this PC's Tailscale IP to limit it to the tailnet.
+.TP
+.BI \-\-port " PORT"
+Default: 8765.
+.TP
+.BI \-\-token " TOKEN"
+Require
+.BI ?token= TOKEN
+in the URL (or an
+.B X\-Token
+header).
+.TP
+.BR \-\-hosts ", " \-\-exclude
+Hosts to offer, as for
+.BR volume .
 .SS "mount"
 Mount each online Linux peer with
 .BR sshfs (1)

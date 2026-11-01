@@ -10,6 +10,8 @@ the local machine is probed directly.
     tailmon.py -w 60 --log m.jsonl   keep a history (one JSON object per host per sample)
     tailmon.py --json             machine-readable snapshot
     tailmon.py --hosts web-1,db-1
+    tailmon.py volume 40          set every host's sound volume to 40 % (+5, -5, mute, toggle; nothing: show)
+    tailmon.py serve              web page to control every host's volume, on http://<this-pc>:8765/
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
     tailmon.py claude|todo|dispatch   run ClaudeExplorer (claude-explorer), which now holds these commands
 """
@@ -18,6 +20,7 @@ import concurrent.futures as cf
 import json
 import shlex
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -318,10 +321,10 @@ try:
     if not os.path.isdir(root):
         emit({"error": "no such directory: %s" % root})
     elif operation == "search":
+        name_matches = re.compile(fnmatch.translate(pattern), re.IGNORECASE if ignore_case else 0).match
         for directory, files in walk(root):
             for name in files:
                 if not name_matches(name):
-        name_matches = re.compile(fnmatch.translate(pattern), re.IGNORECASE if ignore_case else 0).match
                     continue
                 path = os.path.join(directory, name)
                 try:
@@ -1052,10 +1055,10 @@ def file_main(argv):
     common(search)
     search.add_argument("path", nargs="?", default=".", help="root directory on each host")
     search.add_argument("--name", default="*", help="filename glob, e.g. '*.log'")
+    search.add_argument("-i", "--ignore-case", action="store_true", help="match the --name glob case-insensitively")
 
     grep = sub.add_parser("grep", help="search file contents with a regular expression")
     common(grep)
-    search.add_argument("-i", "--ignore-case", action="store_true", help="match the --name glob case-insensitively")
     grep.add_argument("pattern", help="regular expression (or literal with --fixed-strings)")
     grep.add_argument("path", nargs="?", default=".", help="root directory on each host")
     grep.add_argument("--fixed-strings", action="store_true", help="treat pattern as literal text")
@@ -1078,6 +1081,295 @@ def file_main(argv):
     render_file_results(a.operation, rows, errors, skipped, stats, a.json, a.verbose)
 
 
+# ---------------------------------------------------------------------------------------------
+# Volume: read or change the default output's volume on each host (PipeWire, PulseAudio or ALSA),
+# from the command line (`tailmon volume`) or a web page for the whole network (`tailmon serve`).
+# ---------------------------------------------------------------------------------------------
+VOLUME = r'''
+import json, os, re, shutil, subprocess, sys
+ACTION = sys.argv[1] if len(sys.argv) > 1 else "get"  # get | set | up | down | mute | unmute | toggle
+VALUE = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+# A non-interactive ssh session may lack the variables that lead to the user's sound server.
+os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+bus = os.path.join(os.environ["XDG_RUNTIME_DIR"], "bus")
+if "DBUS_SESSION_BUS_ADDRESS" not in os.environ and os.path.exists(bus):
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + bus
+
+def out(*cmd):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip().splitlines() or ["%s: exit %d" % (cmd[0], r.returncode)])[-1])
+    return r.stdout
+
+class Wpctl:
+    name, sink = "pipewire", "@DEFAULT_AUDIO_SINK@"
+    def get(self):
+        s = out("wpctl", "get-volume", self.sink)  # "Volume: 0.40 [MUTED]"
+        if not s.startswith("Volume:"):
+            raise RuntimeError("no default output")
+        return int(round(float(s.split()[1]) * 100)), "MUTED" in s
+    def set(self, pct): out("wpctl", "set-volume", self.sink, "%.2f" % (pct / 100.0))
+    def mute(self, how): out("wpctl", "set-mute", self.sink, {"mute": "1", "unmute": "0", "toggle": "toggle"}[how])
+
+class Pactl:
+    name, sink = "pulseaudio", "@DEFAULT_SINK@"
+    def get(self):
+        vol = re.findall(r"(\d+)%", out("pactl", "get-sink-volume", self.sink))
+        return int(vol[0]) if vol else 0, "yes" in out("pactl", "get-sink-mute", self.sink)
+    def set(self, pct): out("pactl", "set-sink-volume", self.sink, "%d%%" % pct)
+    def mute(self, how): out("pactl", "set-sink-mute", self.sink, {"mute": "1", "unmute": "0", "toggle": "toggle"}[how])
+
+class Amixer:
+    name = "alsa"
+    def get(self):
+        s = out("amixer", "-M", "get", "Master")  # "... [50%] [on]"
+        vol = re.findall(r"\[(\d+)%\]", s)
+        return int(vol[0]) if vol else 0, "[off]" in s
+    def set(self, pct): out("amixer", "-q", "-M", "set", "Master", "%d%%" % pct)
+    def mute(self, how): out("amixer", "-q", "set", "Master", how)
+
+errors = []
+for backend in (Wpctl, Pactl, Amixer):
+    tool = {"pipewire": "wpctl", "pulseaudio": "pactl", "alsa": "amixer"}[backend.name]
+    if not shutil.which(tool):
+        continue
+    b = backend()
+    try:
+        vol, muted = b.get()  # also checks that the sound server answers before changing anything
+        if ACTION in ("set", "up", "down"):
+            target = VALUE if ACTION == "set" else vol + (VALUE if ACTION == "up" else -VALUE)
+            b.set(max(0, min(100, target)))
+        elif ACTION in ("mute", "unmute", "toggle"):
+            b.mute(ACTION)
+        if ACTION != "get":
+            vol, muted = b.get()
+        print(json.dumps({"volume": vol, "muted": muted, "backend": b.name}))
+        sys.exit(0)
+    except Exception as e:
+        errors.append("%s: %s" % (tool, e))
+print(json.dumps({"error": "; ".join(errors) or "no wpctl, pactl or amixer found"}))
+'''
+
+VOLUME_ACTIONS = ("get", "set", "up", "down", "mute", "unmute", "toggle")
+
+
+def volume_cmd(node, cfg, is_self, action, value):
+    args = ["-", action, str(int(value))]
+    if is_self:
+        return [sys.executable] + args
+    user = cfg["users"].get(node["name"], cfg["default_user"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"]
+    if cfg.get("identity"):
+        ssh += ["-i", os.path.expanduser(cfg["identity"])]
+    ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
+    return ssh + ["%s@%s" % (user, node["name"]) if user else node["name"], "python3"] + args
+
+
+def volume(node, cfg, is_self, action="get", value=0):
+    try:
+        r = subprocess.run(volume_cmd(node, cfg, is_self, action, value), input=VOLUME, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return {"host": node["name"], "error": "timeout"}
+    try:
+        return dict(json.loads(r.stdout.strip().splitlines()[-1]), host=node["name"])
+    except (ValueError, IndexError):
+        err = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+        return {"host": node["name"], "error": err[:160]}
+
+
+def volume_all(cfg, only=None, exclude=(), action="get", value=0):
+    targets, _ = targets_for(cfg, only, exclude)
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        futs = [ex.submit(volume, n, cfg, s, action, value) for n, s in targets]
+        return sorted((f.result() for f in futs), key=lambda r: r["host"])
+
+
+def parse_volume_action(text):
+    """'50' -> set 50, '+5' -> up 5, '-5' -> down 5, 'mute' / 'unmute' / 'toggle' / 'get'."""
+    if text in VOLUME_ACTIONS and text not in ("set", "up", "down"):
+        return text, 0
+    if re.fullmatch(r"[+-]?\d{1,3}%?", text):
+        n = int(text.strip("+-%"))
+        return ("up" if text[0] == "+" else "down" if text[0] == "-" else "set"), n
+    raise ValueError("expected a level (50), a step (+5, -5), mute, unmute or toggle, not %r" % text)
+
+
+def volume_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon volume",
+                                 description="Show or change the sound volume of the Tailscale hosts")
+    ap.add_argument("action", nargs="?", default="get",
+                    help="50 (set to 50%%), +5 / -5 (step), mute, unmute or toggle; nothing: show")
+    ap.add_argument("--hosts", help="comma-separated Tailscale hostnames")
+    ap.add_argument("--exclude", metavar="LIST", help="comma-separated Tailscale hostnames to leave alone")
+    ap.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    a = ap.parse_args(argv[1:])
+    try:
+        action, value = parse_volume_action(a.action)
+    except ValueError as e:
+        ap.error(str(e))
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    exclude = set(x for x in a.exclude.split(",") if x) if a.exclude else set()
+    rows = volume_all(load_config(), only, exclude, action, value)
+    if a.json:
+        print(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        if "error" in r:
+            print("%-16s %s" % (r["host"], c("error: " + r["error"], 100)))
+        else:
+            print("%-16s %s %3d%%  %-6s %s" % (r["host"], bar(0 if r["muted"] else r["volume"]), r["volume"],
+                                              "muted" if r["muted"] else "", r["backend"]))
+
+
+VOLUME_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tailnet Volume</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7385; --accent:#3b6fe0; --line:#e1e4ea; --bad:#c43c3c; }
+@media (prefers-color-scheme: dark) { :root { --bg:#14171d; --card:#1e222a; --fg:#e6e9ef; --muted:#8d95a6;
+  --accent:#6d97f5; --line:#2c313b; --bad:#ef6b6b; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; }
+main { max-width:640px; margin:0 auto; padding:20px 16px; }
+h1 { font-size:20px; margin:0 0 4px; } .sub { color:var(--muted); margin:0 0 18px; font-size:13px; }
+.host { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin-bottom:10px; }
+.top { display:flex; align-items:center; gap:10px; } .name { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; }
+.pct { font-variant-numeric:tabular-nums; width:3.5em; text-align:right; color:var(--muted); }
+.row { display:flex; align-items:center; gap:10px; margin-top:8px; }
+input[type=range] { flex:1; accent-color:var(--accent); min-width:0; }
+button { border:1px solid var(--line); background:var(--bg); color:var(--fg); border-radius:8px; padding:6px 10px; font:inherit; cursor:pointer; }
+button.on { background:var(--bad); border-color:var(--bad); color:#fff; }
+.err { color:var(--bad); font-size:13px; margin-top:6px; } .backend { color:var(--muted); font-size:12px; }
+.muted input[type=range] { opacity:.4; }
+</style></head><body><main>
+<h1>Volume</h1><p class="sub">Every online Linux host on the tailnet · <a href="#" id="reload">refresh</a></p>
+<div id="hosts">Loading…</div>
+</main><script>
+const el = document.getElementById("hosts");
+async function api(path, body) {
+  const r = await fetch(path + location.search, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+function card(h) {
+  const d = document.createElement("div"); d.className = "host"; d.dataset.host = h.host;
+  fill(d, h); return d;
+}
+function fill(d, h) {
+  d.innerHTML = "";
+  d.classList.toggle("muted", !!h.muted);
+  const top = document.createElement("div"); top.className = "top";
+  const name = document.createElement("span"); name.className = "name"; name.textContent = h.host;
+  const be = document.createElement("span"); be.className = "backend"; be.textContent = h.backend || "";
+  top.append(name, be); d.append(top);
+  if (h.error) { const e = document.createElement("div"); e.className = "err"; e.textContent = h.error; d.append(e); return; }
+  const row = document.createElement("div"); row.className = "row";
+  const mute = document.createElement("button"); mute.textContent = h.muted ? "Muted" : "Mute"; mute.className = h.muted ? "on" : "";
+  const range = document.createElement("input"); range.type = "range"; range.min = 0; range.max = 100; range.value = h.volume;
+  const pct = document.createElement("span"); pct.className = "pct"; pct.textContent = h.volume + "%";
+  range.oninput = () => pct.textContent = range.value + "%";
+  range.onchange = () => send(d, {action:"set", value:+range.value});
+  mute.onclick = () => send(d, {action:"toggle"});
+  row.append(mute, range, pct); d.append(row);
+}
+async function send(d, body) {
+  try { fill(d, await api("/api/volume/" + encodeURIComponent(d.dataset.host), body)); }
+  catch (e) { fill(d, {host:d.dataset.host, error:String(e.message || e)}); }
+}
+async function load() {
+  try { const hs = await api("/api/volume"); el.innerHTML = ""; hs.forEach(h => el.append(card(h)));
+        if (!hs.length) el.textContent = "No hosts."; }
+  catch (e) { el.textContent = "Error: " + (e.message || e); }
+}
+document.getElementById("reload").onclick = e => { e.preventDefault(); load(); };
+load();
+</script></body></html>
+'''
+
+
+def serve_main(argv):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import unquote, urlparse, parse_qs
+    ap = argparse.ArgumentParser(prog="tailmon serve",
+                                 description="Web page and JSON API to control the volume of every host")
+    ap.add_argument("--bind", default="0.0.0.0", metavar="ADDR",
+                    help="address to listen on (default: all interfaces; 127.0.0.1: this PC only, "
+                         "or this PC's Tailscale IP: the tailnet only)")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--token", help="require ?token=TOKEN (or an X-Token header) on every request")
+    ap.add_argument("--hosts", help="comma-separated Tailscale hostnames to offer")
+    ap.add_argument("--exclude", metavar="LIST", help="comma-separated Tailscale hostnames to leave out")
+    a = ap.parse_args(argv[1:])
+    cfg = load_config()
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    exclude = set(x for x in a.exclude.split(",") if x) if a.exclude else set()
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, code, body, ctype="application/json"):
+            data = (body if isinstance(body, str) else json.dumps(body)).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def allowed(self):
+            if not a.token:
+                return True
+            q = parse_qs(urlparse(self.path).query)
+            if a.token in q.get("token", []) or self.headers.get("X-Token") == a.token:
+                return True
+            self.reply(403, {"error": "forbidden: add ?token=..."})
+            return False
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if not self.allowed():
+                return
+            if path == "/":
+                return self.reply(200, VOLUME_PAGE, "text/html")
+            if path == "/api/volume":
+                return self.reply(200, volume_all(cfg, only, exclude))
+            self.reply(404, {"error": "not found"})
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            if not self.allowed():
+                return
+            if not path.startswith("/api/volume/"):
+                return self.reply(404, {"error": "not found"})
+            host = unquote(path[len("/api/volume/"):])
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                action, value = body.get("action", "get"), int(body.get("value", 0))
+                if action not in VOLUME_ACTIONS or not 0 <= value <= 100:
+                    raise ValueError
+            except (ValueError, TypeError, AttributeError):
+                return self.reply(400, {"error": "expected {\"action\": one of %s, \"value\": 0-100}"
+                                                 % ", ".join(VOLUME_ACTIONS)})
+            if only and host not in only or host in exclude:
+                return self.reply(404, {"error": "unknown host: %s" % host})
+            targets, _ = targets_for(cfg, None, exclude)
+            match = [t for t in targets if t[0]["name"] == host]
+            if not match:
+                return self.reply(404, {"error": "unknown or offline host: %s" % host})
+            self.reply(200, volume(match[0][0], cfg, match[0][1], action, value))
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    server = ThreadingHTTPServer((a.bind, a.port), Handler)
+    shown = "localhost" if a.bind in ("0.0.0.0", "::") else a.bind
+    print("tailmon: volume control on http://%s:%d/%s" % (shown, a.port, "?token=" + a.token if a.token else ""),
+          file=sys.stderr)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
 def claude_explorer(argv):
     """`tailmon claude|todo|dispatch` moved to ClaudeExplorer: run it with the same arguments."""
     cfg = load_config()
@@ -1094,6 +1386,10 @@ def main():
         return file_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in ("mount", "umount"):
         return mount_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "volume":
+        return volume_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        return serve_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in ("claude", "todo", "dispatch"):
         return claude_explorer(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
