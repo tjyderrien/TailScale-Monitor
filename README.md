@@ -100,6 +100,19 @@ whichever answers first, as the SSH user; nothing is installed remotely. The sou
 i.e. someone logged into a desktop session as that user. `serve` shows a slider and a mute button per host
 and exposes a JSON API: `GET /api/volume` lists the hosts, `POST /api/volume/<host>` with
 `{"action": "set", "value": 40}` (or `up`, `down`, `mute`, `unmute`, `toggle`, `get`) changes one.
+Windows and Android hosts are included too (monitoring, search and mount stay Linux-only):
+
+- **Windows**: enable the OpenSSH server (Settings → System → Optional features → *OpenSSH Server*, then
+  `Start-Service sshd; Set-Service sshd -StartupType Automatic` in an admin PowerShell). PowerShell drives
+  the default playback device through the Core Audio API; nothing else to install. Set the Windows login
+  in `users` in the config if it differs from yours.
+- **Android**: install [Termux](https://f-droid.org/packages/com.termux/) and
+  [Termux:API](https://f-droid.org/packages/com.termux.api/) from F-Droid (the same source for both), then
+  `pkg install openssh python termux-api && passwd && sshd` in Termux (port 8022; add your key to
+  `~/.ssh/authorized_keys`) and a `Host <phone> / Port 8022` entry in `~/.ssh/config`. This sets the media
+  volume, in Android's 15 steps; Android has no mute for it, so `mute` remembers the level and sets 0.
+- **iPhone**: not possible, iOS lets no app set the system volume from outside.
+
 It listens on every interface by default with no password: anyone who can reach the port can change the
 volume. Use `--token`, or `--bind` with this PC's Tailscale IP so only the tailnet can reach it.
 

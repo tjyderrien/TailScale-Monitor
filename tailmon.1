@@ -272,6 +272,8 @@ a step
 The default output is driven with
 .BR wpctl ", " pactl " or " amixer ,
 whichever works, so the user's sound server must be running.
+Windows hosts (with the OpenSSH server) are driven through PowerShell and the Core Audio API;
+Android hosts need Termux with sshd, python and Termux:API, and get their media volume set.
 Takes
 .BR \-\-hosts ", " \-\-exclude " and " \-\-json .
 .SS "serve"

@@ -16,6 +16,7 @@ the local machine is probed directly.
     tailmon.py claude|todo|dispatch   run ClaudeExplorer (claude-explorer), which now holds these commands
 """
 import argparse
+import base64
 import concurrent.futures as cf
 import json
 import shlex
@@ -415,7 +416,7 @@ def probe(node, cfg, is_self):
     return json.loads(r.stdout)
 
 
-def targets_for(cfg, only=None, exclude=()):
+def targets_for(cfg, only=None, exclude=(), oses=("linux",)):
     """Return ([(node, is_self)], [skipped nodes]); `exclude` also drops this machine if it is named."""
     me, peers = discover()
     targets, skipped = ([] if me["name"] in exclude else [(me, True)]), []
@@ -424,7 +425,7 @@ def targets_for(cfg, only=None, exclude=()):
             continue
         if p["name"] in cfg["exclude"] or p["name"] in exclude:
             continue
-        if p["os"] != "linux" or not p["online"]:
+        if p["os"] not in oses or not p["online"]:
             skipped.append(p)
             continue
         targets.append((p, False))
@@ -1128,9 +1129,47 @@ class Amixer:
     def set(self, pct): out("amixer", "-q", "-M", "set", "Master", "%d%%" % pct)
     def mute(self, how): out("amixer", "-q", "set", "Master", how)
 
+class Termux:
+    # Android with Termux and Termux:API: the media ("music") stream. Android has no mute for it, so
+    # mute saves the level in a file and sets 0; unmute (or any new level) restores / forgets it.
+    name, saved = "android", os.path.expanduser("~/.tailmon-muted-volume")
+    def music(self):
+        for s in json.loads(out("termux-volume")):
+            if s["stream"] == "music":
+                return s
+        raise RuntimeError("no music stream")
+    def raw(self, steps):
+        out("termux-volume", "music", str(int(steps)))
+    def get(self):
+        s = self.music()
+        pct = int(round(100.0 * s["volume"] / (s["max_volume"] or 1)))
+        return pct, pct == 0 and os.path.exists(self.saved)
+    def set(self, pct):
+        if os.path.exists(self.saved):
+            os.remove(self.saved)
+        s = self.music()
+        steps = int(round(pct * s["max_volume"] / 100.0))
+        now = int(round(100.0 * s["volume"] / (s["max_volume"] or 1)))
+        if steps == s["volume"] and pct != now:  # 15 steps: a small +3 / -3 still moves one
+            steps = max(0, min(s["max_volume"], steps + (1 if pct > now else -1)))
+        self.raw(steps)
+    def mute(self, how):
+        muted = self.get()[1]
+        if how == "toggle":
+            how = "unmute" if muted else "mute"
+        if how == "mute" and not muted:
+            with open(self.saved, "w") as f:
+                f.write(str(self.music()["volume"]))
+            self.raw(0)
+        elif how == "unmute" and muted:
+            with open(self.saved) as f:
+                steps = int(f.read() or 0)
+            os.remove(self.saved)
+            self.raw(steps)
+
 errors = []
-for backend in (Wpctl, Pactl, Amixer):
-    tool = {"pipewire": "wpctl", "pulseaudio": "pactl", "alsa": "amixer"}[backend.name]
+for backend in (Termux, Wpctl, Pactl, Amixer):
+    tool = {"android": "termux-volume", "pipewire": "wpctl", "pulseaudio": "pactl", "alsa": "amixer"}[backend.name]
     if not shutil.which(tool):
         continue
     b = backend()
@@ -1147,8 +1186,58 @@ for backend in (Wpctl, Pactl, Amixer):
         sys.exit(0)
     except Exception as e:
         errors.append("%s: %s" % (tool, e))
-print(json.dumps({"error": "; ".join(errors) or "no wpctl, pactl or amixer found"}))
+print(json.dumps({"error": "; ".join(errors) or "no wpctl, pactl, amixer or termux-volume found"}))
 '''
+
+# Windows: PowerShell drives the default playback device through the Core Audio API (IAudioEndpointVolume).
+VOLUME_WINDOWS = r'''
+$ErrorActionPreference = "Stop"
+try {
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+  int f(); int g(); int h(); int i();
+  int SetMasterVolumeLevelScalar(float level, Guid ctx);
+  int j();
+  int GetMasterVolumeLevelScalar(out float level);
+  int k(); int l(); int m(); int n();
+  int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, Guid ctx);
+  int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice { int Activate(ref Guid id, int ctx, IntPtr p, out IAudioEndpointVolume v); }
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator { int f(); int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice d); }
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumerator { }
+public static class TailmonAudio {
+  static IAudioEndpointVolume V() {
+    IMMDevice d; IAudioEndpointVolume v; Guid id = typeof(IAudioEndpointVolume).GUID;
+    Marshal.ThrowExceptionForHR(((IMMDeviceEnumerator)new MMDeviceEnumerator()).GetDefaultAudioEndpoint(0, 1, out d));
+    Marshal.ThrowExceptionForHR(d.Activate(ref id, 23, IntPtr.Zero, out v));
+    return v;
+  }
+  public static int Get() { float l; Marshal.ThrowExceptionForHR(V().GetMasterVolumeLevelScalar(out l)); return (int)Math.Round(l * 100); }
+  public static void Set(int pct) { Marshal.ThrowExceptionForHR(V().SetMasterVolumeLevelScalar(Math.Max(0, Math.Min(100, pct)) / 100f, Guid.Empty)); }
+  public static bool Muted() { bool m; Marshal.ThrowExceptionForHR(V().GetMute(out m)); return m; }
+  public static void Mute(bool m) { Marshal.ThrowExceptionForHR(V().SetMute(m, Guid.Empty)); }
+}
+"@
+switch ($Action) {
+  "set" { [TailmonAudio]::Set($Value) }
+  "up" { [TailmonAudio]::Set([TailmonAudio]::Get() + $Value) }
+  "down" { [TailmonAudio]::Set([TailmonAudio]::Get() - $Value) }
+  "mute" { [TailmonAudio]::Mute($true) }
+  "unmute" { [TailmonAudio]::Mute($false) }
+  "toggle" { [TailmonAudio]::Mute(-not [TailmonAudio]::Muted()) }
+}
+@{volume = [TailmonAudio]::Get(); muted = [TailmonAudio]::Muted(); backend = "windows"} | ConvertTo-Json -Compress
+} catch { @{error = $_.Exception.Message} | ConvertTo-Json -Compress }
+'''
+# Small, so it fits any remote shell's command line (cmd.exe or PowerShell): it runs the script sent on stdin.
+WINDOWS_BOOTSTRAP = base64.b64encode("Invoke-Expression ([Console]::In.ReadToEnd())".encode("utf-16-le")).decode()
+
+VOLUME_OSES = ("linux", "windows", "android")
 
 VOLUME_ACTIONS = ("get", "set", "up", "down", "mute", "unmute", "toggle")
 
@@ -1157,17 +1246,23 @@ def volume_cmd(node, cfg, is_self, action, value):
     args = ["-", action, str(int(value))]
     if is_self:
         return [sys.executable] + args
+    if node["os"] == "windows":
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", WINDOWS_BOOTSTRAP]
     user = cfg["users"].get(node["name"], cfg["default_user"])
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"]
     if cfg.get("identity"):
         ssh += ["-i", os.path.expanduser(cfg["identity"])]
     ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
-    return ssh + ["%s@%s" % (user, node["name"]) if user else node["name"], "python3"] + args
+    return ssh + ["%s@%s" % (user, node["name"]) if user else node["name"]] + \
+        (args if node["os"] == "windows" else ["python3"] + args)
 
 
 def volume(node, cfg, is_self, action="get", value=0):
+    script = VOLUME
+    if node["os"] == "windows" and not is_self:
+        script = "$Action = '%s'; $Value = %d\n%s" % (action, int(value), VOLUME_WINDOWS)
     try:
-        r = subprocess.run(volume_cmd(node, cfg, is_self, action, value), input=VOLUME, stdout=subprocess.PIPE,
+        r = subprocess.run(volume_cmd(node, cfg, is_self, action, value), input=script, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
     except subprocess.TimeoutExpired:
         return {"host": node["name"], "error": "timeout"}
@@ -1179,7 +1274,7 @@ def volume(node, cfg, is_self, action="get", value=0):
 
 
 def volume_all(cfg, only=None, exclude=(), action="get", value=0):
-    targets, _ = targets_for(cfg, only, exclude)
+    targets, _ = targets_for(cfg, only, exclude, VOLUME_OSES)
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         futs = [ex.submit(volume, n, cfg, s, action, value) for n, s in targets]
         return sorted((f.result() for f in futs), key=lambda r: r["host"])
@@ -1351,7 +1446,7 @@ def serve_main(argv):
                                                  % ", ".join(VOLUME_ACTIONS)})
             if only and host not in only or host in exclude:
                 return self.reply(404, {"error": "unknown host: %s" % host})
-            targets, _ = targets_for(cfg, None, exclude)
+            targets, _ = targets_for(cfg, None, exclude, VOLUME_OSES)
             match = [t for t in targets if t[0]["name"] == host]
             if not match:
                 return self.reply(404, {"error": "unknown or offline host: %s" % host})
