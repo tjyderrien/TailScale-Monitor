@@ -13,7 +13,6 @@ the local machine is probed directly.
     tailmon.py volume 40          set every host's sound volume to 40 % (+5, -5, mute, toggle; nothing: show)
     tailmon.py serve              web page to control every host's volume, on http://<this-pc>:8765/
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
-    tailmon.py claude|todo|dispatch   run ClaudeExplorer (claude-explorer), which now holds these commands
 """
 import argparse
 import base64
@@ -37,8 +36,6 @@ DEFAULT_CONFIG = {
     # SSH private key passed with -i; null: ssh's usual keys / agent.
     "identity": None,
     "exclude": [],
-    # `tailmon claude|todo|dispatch`: the ClaudeExplorer program to run; null: `claude-explorer` on the PATH.
-    "claude_explorer": None,
     "sample_seconds": 1.0,
     # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
     "discover_seconds": 30.0,
@@ -1465,17 +1462,6 @@ def serve_main(argv):
         server.server_close()
 
 
-def claude_explorer(argv):
-    """`tailmon claude|todo|dispatch` moved to ClaudeExplorer: run it with the same arguments."""
-    cfg = load_config()
-    exe = os.path.expanduser(cfg["claude_explorer"] or "") or shutil.which("claude-explorer")
-    if not exe:
-        sys.exit("tailmon: `%s` is now part of ClaudeExplorer (https://github.com/tjyderrien/ClaudeXplorer).\n"
-                 "  Put claude_explorer.py on the PATH as claude-explorer, or set \"claude_explorer\" in %s"
-                 % (argv[0], CONFIG_PATH))
-    os.execv(exe, [exe] + ([] if argv[0] == "claude" else [argv[0]]) + argv[1:])
-
-
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("search", "grep"):
         return file_main(sys.argv[1:])
@@ -1485,8 +1471,6 @@ def main():
         return volume_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         return serve_main(sys.argv[1:])
-    if len(sys.argv) > 1 and sys.argv[1] in ("claude", "todo", "dispatch"):
-        return claude_explorer(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")

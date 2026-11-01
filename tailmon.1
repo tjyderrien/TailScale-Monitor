@@ -65,10 +65,6 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-hosts
 .IR LIST ]
 .RB [ \-\-json ]
-.br
-.B tailmon claude
-.RI | todo | dispatch
-.RI [ ARGS ...]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -336,25 +332,6 @@ Only these comma\-separated Tailscale hostnames.
 Print
 .B {"results": [...], "skipped": [...]}
 instead of text.
-.SS "claude, todo, dispatch"
-Run ClaudeExplorer
-.RB ( claude\-explorer ),
-which now holds these commands, with the same arguments:
-.B tailmon claude
-runs
-.BR claude\-explorer ,
-.B tailmon todo
-runs
-.BR "claude\-explorer todo" ,
-and
-.B tailmon dispatch
-runs
-.BR "claude\-explorer dispatch" .
-The program is looked up on the
-.B PATH
-unless
-.B claude_explorer
-is set. See https://github.com/tjyderrien/ClaudeXplorer.
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -441,18 +418,6 @@ your usual keys or agent.
 .TP
 .B exclude
 Tailscale hostnames never to probe or search.
-.TP
-.B claude_explorer
-Program run by
-.BR claude ,
-.B todo
-and
-.BR dispatch .
-Default
-.BR null :
-.B claude\-explorer
-on the
-.BR PATH .
 .TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.
@@ -541,10 +506,6 @@ Mount the root filesystem of every peer at
 .TP
 .B tailmon umount
 Unmount them again.
-.TP
-.B tailmon claude \-\-by host
-Claude Code sessions on every host, one table per machine (runs
-.BR claude\-explorer ).
 .SH SEE ALSO
 .BR tailscale (1),
 .BR ssh (1),
