@@ -16,6 +16,7 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RI [ PATH ]
 .RB [ \-\-name
 .IR GLOB ]
+.RB [ \-i ]
 .RB [ \-\-hosts
 .IR LIST ]
 .RB [ \-\-exclude
@@ -146,6 +147,14 @@ Shell\-style filename pattern, e.g.\&
 Default:
 .BR * .
 Quote it so your local shell does not expand it.
+.TP
+.BR \-i ", " \-\-ignore\-case
+Match
+.I GLOB
+case\-insensitively, so
+.B \(aq*.pdf\(aq
+also finds
+.IR REPORT.PDF .
 .SS "grep PATTERN [PATH]"
 Search the contents of text files under
 .I PATH

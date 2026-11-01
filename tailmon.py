@@ -320,7 +320,8 @@ try:
     elif operation == "search":
         for directory, files in walk(root):
             for name in files:
-                if not fnmatch.fnmatch(name, pattern):
+                if not name_matches(name):
+        name_matches = re.compile(fnmatch.translate(pattern), re.IGNORECASE if ignore_case else 0).match
                     continue
                 path = os.path.join(directory, name)
                 try:
@@ -1054,6 +1055,7 @@ def file_main(argv):
 
     grep = sub.add_parser("grep", help="search file contents with a regular expression")
     common(grep)
+    search.add_argument("-i", "--ignore-case", action="store_true", help="match the --name glob case-insensitively")
     grep.add_argument("pattern", help="regular expression (or literal with --fixed-strings)")
     grep.add_argument("path", nargs="?", default=".", help="root directory on each host")
     grep.add_argument("--fixed-strings", action="store_true", help="treat pattern as literal text")

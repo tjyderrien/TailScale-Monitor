@@ -109,6 +109,7 @@ it found so far, and the error says which path it was reading. `-v` prints a per
 time, walk rate, directories and files walked, depth reached below the root) on stderr. `-vv` also shows a
 live progress bar per host with the walk rate, the current depth / deepest so far and the path being
 searched, redrawn in place without scrolling. It costs a little extra traffic: each host sends its
+tailmon search ~/Documents --name '*invoice*' -i     # case-insensitive: also Invoice.PDF
 position twice a second, only when it changed, which also shows where a slow disk is stuck:
 
 ```
