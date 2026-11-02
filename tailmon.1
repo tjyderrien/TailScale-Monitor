@@ -113,6 +113,16 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .br
 .B tailmon completion
 .BR zsh | bash
+.br
+.B tailmon lyx
+.IR FILE.lyx ...
+.RB [ \-\-dpi
+.IR N ]
+.RB [ \-\-force ]
+.RB [ \-\-back ]
+.RB [ \-n ]
+.RB [ \-q ]
+.RB [ \-\-json ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -589,6 +599,49 @@ unchecked. On a host, its owner can run
 (approved scripts, latest log),
 .BI "gate.py approve " SHA256
 .RI [ name ]
+.SS "lyx FILE.lyx ..."
+Make a LyX document light to open when its figures live on other machines (for example under
+.IR /media/tailscale ).
+Every EPS figure
+.RI ( .eps ", " .epsi ", " .epsf )
+of each file is converted with
+.BR gs (1)
+to
+.IB name .eps.png
+next to the EPS, on the host that holds it: a path under an sshfs mount is converted by that host over
+SSH, so only the PNG crosses the network; other paths are converted locally. The document's
+.B filename
+lines are then pointed at the PNGs. The previous version is kept as
+.IB FILE .lyx~ \fR.\fP
+PNGs that are newer than their EPS are reused. The PNG keeps the physical size of the EPS bounding box,
+so
+.BR width ,
+.B height
+and
+.B scale
+settings are unchanged. A figure that cannot be converted keeps its EPS and is reported; the exit
+status is then 1. The remote hosts need
+.B python3
+and
+.BR gs .
+.TP
+.BI \-\-dpi " N"
+PNG resolution. Default: 150.
+.TP
+.B \-\-force
+Convert again even when the PNG is up to date.
+.TP
+.B \-\-back
+Point the document at the original EPS files again (for print quality), where they still exist.
+.TP
+.BR \-n ", " \-\-dry\-run
+Show what would change; write nothing.
+.TP
+.BR \-q ", " \-\-quiet
+Only the summary, no line per figure.
+.TP
+.B \-\-json
+Print one summary object per file.
 and
 .BI "gate.py revoke " SHA256
 with the

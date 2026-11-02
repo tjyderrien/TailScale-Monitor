@@ -37,6 +37,8 @@ server-1         64 cores  load 0.10 0.07 0.07
   online Linux and macOS peers, without installing anything on them.
 - **Hosts approve what runs.** `tailmon gate install` gives tailmon its own SSH key, which each host only
   accepts for the exact tailmon scripts it approved (by SHA-256): no shell, no forwarding, no other code.
+- **Light LyX files.** `lyx` converts a document's EPS figures to PNG on the hosts that hold them, so
+  LyX opens it fast through the mounts.
 - **Tailnet mounts.** `mount` puts every online Linux and macOS peer's filesystem under `/media/tailscale/<host>` with
   `sshfs`, so ordinary programs (image viewers, scripts, …) can open files from all machines at once,
   with the same path layout on every host.
@@ -362,6 +364,36 @@ brew install macos-fuse-t/homebrew-cask/fuse-t-sshfs` (no kernel extension, no r
 On macOS, a search over SSH can't see `~/Documents`, `~/Desktop`, `~/Downloads` and other protected
 folders until you allow it: System Settings → General → Sharing → Remote Login → ⓘ → *Allow full disk
 access for remote users*.
+
+### Light LyX files over the tailnet
+
+A LyX document whose figures sit on other machines (e.g. `/media/tailscale/luzicka/...`) opens slowly:
+LyX reads every EPS through sshfs and renders it locally, and a plot exported as EPS easily weighs 10 MB.
+`tailmon lyx` converts each EPS figure to `<name>.eps.png` next to it, **on the host that holds it**,
+then points the document at the PNGs:
+
+```sh
+tailmon lyx -n talk.lyx       # dry run: which figures, on which hosts
+tailmon lyx talk.lyx          # convert and repoint (previous version kept as talk.lyx~)
+tailmon lyx --back talk.lyx   # point at the original EPS files again, e.g. for print quality
+```
+
+```
+talk.lyx
+  luzicka      converted     12.1M -> 61.5K   3eV-1600.0nm_TwoBandsOnePhoton.eps
+talk.lyx: 3 figure(s), 1 EPS on luzicka; repointed 1 to PNG, 12.1M of EPS -> 61.5K of PNG
+```
+
+- Paths under an sshfs mount (`tailmon mount`) are converted by that host over SSH with Ghostscript, so
+  the EPS never crosses the network; other paths are converted locally. Hosts work in parallel.
+- A PNG newer than its EPS is reused, so running it again is cheap; `--force` converts again.
+- The PNG carries the EPS's physical size (`--dpi`, default 150), so `width`, `height` and `scale` in LyX
+  stay right. PNGs also let pdfLaTeX compile the document directly.
+- A figure that cannot be converted (missing EPS, no `gs` on the host, read-only directory) keeps its EPS
+  and is reported; the exit status is then 1.
+- If LyX has the file open, use *File ▸ Revert to Saved* afterwards.
+
+Needs `gs` (Ghostscript) and `python3` on each host holding figures.
 
 ### Sharpness of every machine
 

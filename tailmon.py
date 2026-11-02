@@ -13,6 +13,7 @@ the local machine is probed directly.
     tailmon.py volume 40          set every host's sound volume to 40 % (+5, -5, mute, toggle; nothing: show)
     tailmon.py serve              web page to control every host's volume, on http://<this-pc>:8765/
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host>, ~/tailscale on a Mac (umount to undo)
+    tailmon.py lyx paper.lyx      convert its EPS figures to PNG on the hosts holding them (--back to undo)
     tailmon.py gate install       let each host approve the scripts tailmon runs on it (own key + gate)
     tailmon.py tasks              the last 3 Todoist tasks each host ran (claude-explorer dispatch), read-only
     tailmon.py flows -w 2         live traffic between the hosts (also: tailmon.py -w 1 --flows)
@@ -1405,6 +1406,268 @@ def mount_main(argv):
     if skipped:
         print("not mounted: " + ", ".join(
             "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------
+# LyX: convert the EPS figures of a .lyx file to PNG on the host that holds them, so the file
+# opens fast through /media/tailscale (a 12 MB EPS read over sshfs becomes a ~100 KB PNG).
+# ---------------------------------------------------------------------------------------------
+# Runs on the host holding the EPS files (stdlib only). argv: dpi, force (0/1), JSON list of paths.
+# Writes <name>.eps.png next to each <name>.eps (atomically, only when missing or older than the EPS)
+# and prints one JSON line per file as it finishes.
+EPS2PNG = r'''
+import concurrent.futures as cf, json, os, shutil, subprocess, sys
+dpi, force, paths = int(sys.argv[1]), sys.argv[2] == "1", json.loads(sys.argv[3])
+gs = shutil.which("gs")
+
+def convert(eps):
+    row = {"eps": eps, "png": eps + ".png"}
+    try:
+        st = os.stat(eps)
+    except OSError as exc:
+        return dict(row, error="EPS not found: %s" % exc.strerror)
+    row["eps_bytes"] = st.st_size
+    png = row["png"]
+    try:
+        old = os.stat(png)
+        if not force and old.st_mtime >= st.st_mtime and old.st_size > 0:
+            return dict(row, status="up to date", png_bytes=old.st_size)
+    except OSError:
+        pass
+    if not gs:
+        return dict(row, error="ghostscript (gs) is not installed on this host")
+    tmp = "%s.tmp-%d" % (png, os.getpid())
+    cmd = [gs, "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=png16m", "-dEPSCrop", "-r%d" % dpi,
+           "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4", "-sOutputFile=" + tmp.replace("%", "%%"), eps]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=600)
+        if r.returncode != 0 or not os.path.getsize(tmp):
+            err = (r.stderr.strip().splitlines() or ["gs exit %d" % r.returncode])[-1]
+            raise RuntimeError(err[:160])
+        os.replace(tmp, png)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return dict(row, error=str(exc) or type(exc).__name__)
+    return dict(row, status="converted", png_bytes=os.path.getsize(png))
+
+with cf.ThreadPoolExecutor(max_workers=4) as ex:
+    for row in ex.map(convert, paths):
+        print(json.dumps(row), flush=True)
+'''
+
+EPS_EXT = (".eps", ".epsi", ".epsf")
+
+
+def lyx_graphics(lines):
+    """Yield (line index, filename, quoted) for every `filename` line of a Graphics inset."""
+    inside = False
+    for i, line in enumerate(lines):
+        if line.startswith("\\begin_inset Graphics"):
+            inside = True
+        elif inside and line.startswith("\\end_inset"):
+            inside = False
+        elif inside and line.startswith("\tfilename "):
+            name = line[len("\tfilename "):]
+            quoted = len(name) > 1 and name[0] == name[-1] == '"'
+            yield i, (name[1:-1] if quoted else name), quoted
+
+
+def sshfs_sources():
+    """{mount point: (ssh host spec, remote dir)} for the sshfs mounts in /proc/mounts."""
+    out = {}
+    with open("/proc/mounts") as f:
+        for line in f:
+            src, point, fstype = line.split()[:3]
+            if fstype == "fuse.sshfs" and ":" in src:
+                host, remote = src.encode().decode("unicode_escape").split(":", 1)
+                out[point.encode().decode("unicode_escape")] = (host, remote or "/")
+    return out
+
+
+def locate(path, mounts):
+    """(ssh host spec, or None for this machine; the path as that host sees it) for a local path."""
+    for point in sorted(mounts, key=len, reverse=True):
+        if path == point or path.startswith(point.rstrip("/") + "/"):
+            host, remote = mounts[point]
+            rest = path[len(point):].lstrip("/")
+            return host, os.path.join(remote, rest) if rest else remote
+    return None, path
+
+
+def eps2png_cmd(host, cfg, nodes, dpi, force, paths):
+    args = ["-", str(dpi), "1" if force else "0", json.dumps(paths)]
+    if host is None:
+        return [sys.executable] + args
+    name = host.split("@")[-1]
+    user = host.split("@")[0] if "@" in host else cfg["users"].get(name, cfg["default_user"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
+           "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
+    if cfg.get("identity"):
+        ssh += ["-i", os.path.expanduser(cfg["identity"])]
+    node = nodes.get(name)
+    if node:
+        ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
+    return ssh + ["%s@%s" % (user, name) if user else name] + [shlex.quote(v) for v in ["python3"] + args]
+
+
+def convert_on(host, cfg, nodes, dpi, force, jobs, report):
+    """Convert jobs ({path on host: local path}) on one host; return {local path: result row}."""
+    label = host.split("@")[-1] if host else "local"
+    done = {}
+    try:
+        proc = subprocess.Popen(eps2png_cmd(host, cfg, nodes, dpi, force, sorted(jobs)), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    except OSError as exc:
+        return {local: {"host": label, "error": str(exc)} for local in jobs.values()}
+    proc.stdin.write(EPS2PNG)
+    proc.stdin.close()
+    for line in proc.stdout:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        local = jobs.get(row.get("eps"))
+        if local:
+            row["host"] = label
+            done[local] = row
+            report(local, row)
+    err = proc.stderr.read().strip().splitlines()
+    proc.wait()
+    for local in jobs.values():
+        if local not in done:
+            done[local] = {"host": label, "error": (err or ["exit %d" % proc.returncode])[-1][:160]}
+            report(local, done[local])
+    return done
+
+
+def lyx_light(path, cfg, dpi, force, back, dry_run, verbose):
+    """Point the EPS figures of one .lyx file at PNG copies (or back to the EPS with `back`)."""
+    with open(path, encoding="utf-8", newline="") as f:
+        lines = f.read().split("\n")
+    base = os.path.dirname(os.path.abspath(path))
+    graphics = list(lyx_graphics(lines))
+    summary = {"lyx": path, "figures": len(graphics), "changed": 0, "errors": [], "eps_bytes": 0, "png_bytes": 0}
+
+    def full(name):
+        return os.path.normpath(os.path.join(base, os.path.expanduser(name)))
+
+    def set_name(i, name, quoted):
+        lines[i] = "\tfilename " + ('"%s"' % name if quoted else name)
+        summary["changed"] += 1
+
+    if back:
+        for i, name, quoted in graphics:
+            if name.lower().endswith(tuple(e + ".png" for e in EPS_EXT)) and os.path.exists(full(name[:-4])):
+                set_name(i, name[:-4], quoted)
+    else:
+        eps = [(i, name, quoted) for i, name, quoted in graphics if name.lower().endswith(EPS_EXT)]
+        mounts = sshfs_sources()
+        by_host = {}
+        for _, name, _ in eps:
+            host, there = locate(full(name), mounts)
+            by_host.setdefault(host, {})[there] = full(name)
+        nodes = {}
+        if any(by_host):
+            try:
+                me, peers = discover()
+                nodes = {n["name"]: n for n in [me] + peers}
+            except (OSError, subprocess.CalledProcessError, ValueError):
+                pass  # no tailscale CLI: plain `ssh <host>` still works
+        lock = threading.Lock()
+
+        def report(local, row):
+            if verbose and "error" not in row:  # errors are listed once, in the summary
+                with lock:
+                    what = row["status"]
+                    size = (" %7s -> %-7s" % (hb(row["eps_bytes"]), hb(row["png_bytes"]))
+                            if "png_bytes" in row else "")
+                    print("  %-12s %-11s%s %s" % (row["host"], what, size, os.path.basename(local)),
+                          file=sys.stderr)
+
+        results = {}
+        if dry_run:
+            for host, jobs in by_host.items():
+                for local in jobs.values():
+                    results[local] = {"host": host.split("@")[-1] if host else "local"}
+        else:
+            with cf.ThreadPoolExecutor(max_workers=8) as ex:
+                for part in ex.map(lambda h: convert_on(h, cfg, nodes, dpi, force, by_host[h], report), by_host):
+                    results.update(part)
+        counted = set()
+        for i, name, quoted in eps:
+            row = results.get(full(name), {})
+            if "error" in row:
+                summary["errors"].append({"figure": name, "host": row.get("host"), "error": row["error"]})
+                continue
+            if full(name) not in counted:  # the same figure can appear many times
+                counted.add(full(name))
+                summary["eps_bytes"] += row.get("eps_bytes", 0)
+                summary["png_bytes"] += row.get("png_bytes", 0)
+            set_name(i, name + ".png", quoted)
+        summary["eps"] = len(eps)
+        summary["hosts"] = sorted(h.split("@")[-1] if h else "local" for h in by_host)
+
+    if summary["changed"] and not dry_run:
+        shutil.copy2(path, path + "~")  # LyX's own backup name, ignored by the usual .gitignore
+        tmp = path + ".tailmon-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines))
+        shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    return summary
+
+
+def lyx_main(argv):
+    ap = argparse.ArgumentParser(
+        prog="tailmon lyx",
+        description="Make a LyX file light to open over the tailnet: convert its EPS figures to PNG "
+                    "(<name>.eps.png next to each EPS) on the host that holds them, then point the "
+                    "document at the PNGs. EPS files under a `tailmon mount` are converted by their own "
+                    "host, so only the small PNGs cross the network.")
+    ap.add_argument("files", nargs="+", metavar="FILE.lyx")
+    ap.add_argument("--dpi", type=int, default=150, help="PNG resolution (default %(default)s; the PNG keeps the "
+                                                         "EPS's physical size, so width/scale stay right)")
+    ap.add_argument("--force", action="store_true", help="convert again even when the PNG is up to date")
+    ap.add_argument("--back", action="store_true",
+                    help="undo: point the document at the original EPS files again (e.g. for print quality)")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show what would change; touch nothing")
+    ap.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    ap.add_argument("-q", "--quiet", action="store_true", help="no per-figure lines, only the summary")
+    a = ap.parse_args(argv[1:])
+    if not 10 <= a.dpi <= 2400:
+        ap.error("--dpi must be between 10 and 2400")
+    cfg = load_config()
+    summaries = []
+    for path in a.files:
+        if not (a.json or a.quiet):
+            print("%s%s" % (path, " (dry run)" if a.dry_run else ""), file=sys.stderr)
+        try:
+            summaries.append(lyx_light(path, cfg, a.dpi, a.force, a.back, a.dry_run, not (a.json or a.quiet)))
+        except (OSError, UnicodeError) as exc:
+            summaries.append({"lyx": path, "errors": [{"error": str(exc)}], "changed": 0})
+    status = 1 if any(s["errors"] for s in summaries) else 0
+    if a.json:
+        print(json.dumps(summaries, indent=2))
+        sys.exit(status)
+    verb = "would repoint" if a.dry_run else "repointed"
+    for s in summaries:
+        if a.back:
+            print("%s: %s %d figure(s) back to EPS" % (s["lyx"], verb, s["changed"]))
+        elif "eps" in s:
+            saved = (", %s of EPS -> %s of PNG" % (hb(s["eps_bytes"]), hb(s["png_bytes"]))
+                     if s["png_bytes"] else "")
+            print("%s: %d figure(s), %d EPS on %s; %s %d to PNG%s"
+                  % (s["lyx"], s["figures"], s["eps"], ", ".join(s["hosts"]) or "-", verb, s["changed"], saved))
+        for e in s["errors"]:
+            print("  %s" % c("ERROR: %s%s" % (("%s: " % e["figure"]) if "figure" in e else "", e["error"]), 100),
+                  file=sys.stderr)
+        if s["changed"] and not a.dry_run:
+            print("  previous version saved as %s~ (if LyX has the file open: File > Revert to Saved)" % s["lyx"])
+    sys.exit(status)
 
 
 class Stream:
@@ -3830,6 +4093,8 @@ def main():
         return file_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in ("mount", "umount"):
         return mount_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "lyx":
+        return lyx_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "volume":
         return volume_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
