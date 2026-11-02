@@ -31,7 +31,7 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .IR LIST ]
 .br
 .B tailmon search
-.RI [ PATH ]
+.RI [ PATH " | " NAME ]
 .RB [ \-\-name
 .IR GLOB ]
 .RB [ \-i ]
@@ -46,6 +46,11 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-boom ]
 .RB [ \-\-timeout
 .IR SEC ]
+.RB [ \-\-live
+.RB [ \-\-top
+.IR N ]]
+.RB [ \-\-log
+.IR FILE ]
 .RB [ \-v | \-vv ]
 .RB [ \-\-json ]
 .br
@@ -65,6 +70,11 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-boom ]
 .RB [ \-\-timeout
 .IR SEC ]
+.RB [ \-\-live
+.RB [ \-\-top
+.IR N ]]
+.RB [ \-\-log
+.IR FILE ]
 .RB [ \-v | \-vv ]
 .RB [ \-\-json ]
 .br
@@ -210,26 +220,45 @@ with
 it prints the merged links
 .RB ( from ", " to ", " rate ", " tailscale ", " tcp )
 instead of the per\-host results.
-.SS "search [PATH]"
-Find regular files whose name matches a glob under
+.SS "search [PATH | NAME]"
+Find regular files and directories whose name matches a glob under
 .I PATH
 (default: the remote user's home directory, i.e.\&
 .BR . ).
+Without
+.BR \-\-name ,
+a bare word (no
+.BR / ,
+not starting with
+.B .
+or
+.BR ~ )
+is taken as the name to find, so
+.B tailmon search Marques
+is
+.BR "tailmon search . \-\-name Marques" .
 Symbolic links to directories are not followed. Output is one
 .IB host ": " path
-line per match.
+line per match; directories end with
+.BR / .
 .TP
 .BI \-\-name " GLOB"
 Shell\-style filename pattern, e.g.\&
 .BR \(aq*.log\(aq .
-Default:
-.BR * .
+Text without
+.BR * ,
+.B ?
+or
+.B [
+matches anywhere in the name:
+.B Marques
+is
+.BR \(aq*Marques*\(aq .
+Default: everything.
 Quote it so your local shell does not expand it.
 .TP
 .BR \-i ", " \-\-ignore\-case
-Match
-.I GLOB
-case\-insensitively, so
+Match the name case\-insensitively, so
 .B \(aq*.pdf\(aq
 also finds
 .IR REPORT.PDF .
@@ -314,6 +343,43 @@ seconds; what it found until then is kept, and the error names the path it was r
 .BR \-vv ).
 .B 0
 means no limit. Default: 300.
+.TP
+.B \-\-live
+Show results while searching, without waiting for the slowest host: one progress line per host
+(as with
+.BR \-vv )
+and, below it, the number of results so far and the first
+.B \-\-top
+of them, redrawn in place on standard error. Every result is also appended to the log
+.RB ( \-\-log )
+the moment it is found. Press Ctrl\-C to stop all hosts: what was found so far is printed as usual
+and the unfinished hosts are reported as
+.BR "interrupted in " \fIpath\fR.
+.TP
+.BI \-\-top " N"
+With
+.BR \-\-live ,
+how many results to keep on screen (default 5; 0 shows only the count).
+.TP
+.BI \-\-log " FILE"
+Append every result to
+.I FILE
+as soon as it is found, in the same format as the output, between a
+.B #
+header line (the command and start time) and a
+.B #
+footer line
+.RB ( done " or " interrupted ,
+with the count). Follow it from another terminal with
+.BR "tail \-f" .
+With
+.B \-\-live
+and no
+.BR \-\-log ,
+the log is
+.IR ~/.cache/tailmon/ { search | grep } \- YYYYmmdd \- HHMMSS .log .
+It holds every result found, even past
+.BR \-\-max\-results .
 .TP
 .BR \-v ", " \-\-verbose
 Once: after the search, print one line per host on standard error with the number of matches,

@@ -781,8 +781,8 @@ def walk(top):
                 continue
             (dirs if is_dir else files).append(entry.name)
         state["files"] += len(files)
-        yield directory, files
         dirs.sort()
+        yield directory, files, dirs
         step = share / len(dirs) if dirs else 0.0
         for i in reversed(range(len(dirs))):
             child = os.path.abspath(os.path.join(directory, dirs[i]))
@@ -806,10 +806,16 @@ try:
     if not os.path.isdir(root):
         emit({"error": "no such directory: %s" % root})
     elif operation == "search":
-        name_matches = re.compile(fnmatch.translate(pattern), re.IGNORECASE if ignore_case else 0).match
-        for directory, files in walk(root):
+        # Case-sensitive unless asked (fnmatch.fnmatch would follow the OS: insensitive on Windows).
+        glob = pattern.lower() if ignore_case else pattern
+        def matches(name):
+            return fnmatch.fnmatchcase(name.lower() if ignore_case else name, glob)
+        for directory, files, dirs in walk(root):
+            for name in dirs:
+                if matches(name):
+                    found({"path": os.path.join(directory, name), "dir": True})
             for name in files:
-                if not name_matches(name):
+                if not matches(name):
                     continue
                 path = os.path.join(directory, name)
                 try:
@@ -821,7 +827,7 @@ try:
     elif operation == "grep":
         flags = re.IGNORECASE if ignore_case else 0
         matcher = re.compile(re.escape(pattern) if fixed else pattern, flags)
-        for directory, files in walk(root):
+        for directory, files, _ in walk(root):
             for name in files:
                 path = os.path.join(directory, name)
                 state["path"] = path
@@ -1012,15 +1018,25 @@ def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, i
 class FileJob:
     """One host's search/grep: results and progress as they stream in; partial results survive a timeout."""
 
-    def __init__(self, node):
-        self.node = node
+    def __init__(self, node, on_row=None):
+        self.node, self.on_row = node, on_row
         self.rows, self.error, self.done, self.finished = [], None, None, False
         self.progress, self.path_since = None, time.time()
         self.started = time.time()
+        self.proc, self.stopped = None, False
+
+    def stop(self):
+        """Ctrl-C: end the walk now; what was found so far is kept."""
+        self.stopped = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
 
     def run(self, cmd, timeout):
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                universal_newlines=True, bufsize=1)
+        if self.stopped:
+            self.error, self.finished = "interrupted before it started", True
+            return
+        proc = self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, universal_newlines=True, bufsize=1)
         stderr = []
         threading.Thread(target=lambda: stderr.extend(proc.stderr), daemon=True).start()
         timer = threading.Timer(timeout, proc.kill) if timeout else None
@@ -1043,12 +1059,18 @@ class FileJob:
             elif "done" in row:
                 self.done = row["done"]
             else:
-                self.rows.append(dict(row, node=self.node["name"]))
+                row = dict(row, node=self.node["name"])
+                self.rows.append(row)
+                if self.on_row and "error" not in row:
+                    self.on_row(row)
         code = proc.wait()
         timed_out = timer is not None and not timer.is_alive() and self.done is None
         if timer:
             timer.cancel()
-        if timed_out:
+        if self.stopped and self.done is None:
+            where = " in %s" % self.progress["path"] if self.progress else ""
+            self.error = "interrupted%s" % where
+        elif timed_out:
             where = " in %s" % self.progress["path"] if self.progress else ""
             self.error = "timeout after %ds%s" % (timeout, where)
         elif code != 0:
@@ -1089,12 +1111,14 @@ class FileJob:
 class ProgressBoard:
     """A block of one line per host on stderr, redrawn in place (no scrolling) and erased at the end."""
 
-    def __init__(self, jobs):
-        self.jobs, self.drawn = jobs, 0
+    def __init__(self, jobs, feed=None):
+        self.jobs, self.drawn, self.feed = jobs, 0, feed
 
     def draw(self):
         width = shutil.get_terminal_size((120, 40)).columns - 1  # never wrap, or cursor-up would miss lines
         lines = [j.status_line(width) for j in sorted(self.jobs, key=lambda j: j.node["name"])]
+        if self.feed:
+            lines += self.feed.lines(width)
         up = "\033[%dA" % self.drawn if self.drawn else ""
         sys.stderr.write(up + "\r" + "".join("\033[K%s\n" % l for l in lines))
         sys.stderr.flush()
@@ -1107,25 +1131,92 @@ class ProgressBoard:
             self.drawn = 0
 
 
+def result_line(operation, row):
+    if operation == "grep":
+        return "%s:%s:%s: %s" % (row["node"], row["path"], row["line"], row["text"])
+    return "%s: %s%s" % (row["node"], row["path"], "/" if row.get("dir") else "")
+
+
+class LiveFeed:
+    """Results in the order they arrive: the first `top` stay on screen, every one goes to the log at once."""
+
+    def __init__(self, operation, top, log):
+        self.operation, self.top, self.log = operation, top, log
+        self.first, self.count, self.lock = [], 0, threading.Lock()
+
+    def add(self, row):
+        line = result_line(self.operation, row)
+        with self.lock:
+            self.count += 1
+            if len(self.first) < self.top:
+                self.first.append(line)
+            if self.log:
+                self.log.write(line + "\n")
+                self.log.flush()  # readable with `tail -f` while the search runs
+
+    def lines(self, width):
+        with self.lock:
+            more = self.count - len(self.first)
+            head = "── %d result%s so far" % (self.count, "" if self.count == 1 else "s")
+            if self.top and self.count:
+                head += ", first %d" % len(self.first)
+            if self.log:
+                head += " · all in the log"
+            out = [head[:width]] + [l[:width] for l in self.first]
+            if more > 0 and self.top:
+                out.append(("   … %d more" % more)[:width])
+            return out
+
+
+def open_log(path, operation, argv):
+    """The log file for --live/--log: one result per line, written as results arrive."""
+    if not path:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(os.path.expanduser("~/.cache/tailmon"), "%s-%s.log" % (operation, stamp))
+    path = os.path.expanduser(path)
+    if os.path.dirname(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    log = open(path, "a", encoding="utf-8", errors="replace")
+    log.write("# tailmon %s  (started %s)\n" % (" ".join(shlex.quote(a) for a in argv),
+                                                 time.strftime("%Y-%m-%d %H:%M:%S")))
+    log.flush()
+    return log
+
+
 def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=False, fixed=False,
-              verbose=0, timeout=0, proc=False, boom=False, exclude=()):
+              verbose=0, timeout=0, proc=False, boom=False, exclude=(), live=0, log=None):
+    """`live`: show the first `live` results on the board while searching (-1: board without results)."""
     targets, skipped = targets_for(cfg, only, exclude, FILE_OSES)
-    jobs = [FileJob(n) for n, _ in targets]
-    board = ProgressBoard(jobs) if verbose >= 2 and sys.stderr.isatty() else None
+    feed = LiveFeed(operation, max(live, 0), log) if (live or log) else None
+    jobs = [FileJob(n, feed.add if feed else None) for n, _ in targets]
+    board = (ProgressBoard(jobs, feed if live else None)
+             if (verbose >= 2 or live) and sys.stderr.isatty() else None)
+    interrupted = False
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         futs = [ex.submit(job.run, file_tool_cmd(n, cfg, is_self, operation, root, pattern, limit, hidden,
                                                  ignore_case, fixed, board is not None, proc, boom),
                                  timeout)
                 for job, (n, is_self) in zip(jobs, targets)]
         try:
-            while board and not all(f.done() for f in futs):
-                board.draw()
-                cf.wait(futs, timeout=0.2)
+            try:
+                while not all(f.done() for f in futs):
+                    if board:
+                        board.draw()
+                    cf.wait(futs, timeout=0.2)
+            except KeyboardInterrupt:  # stop every host, keep and print what was found
+                interrupted = True
+                for job in jobs:
+                    job.stop()
         finally:
             if board:
                 board.clear()
         for f in futs:
             f.result()
+    if log:
+        found = len([r for job in jobs for r in job.rows if "error" not in r])
+        log.write("# %s %s: %d result(s)\n" % ("interrupted" if interrupted else "done",
+                                               time.strftime("%Y-%m-%d %H:%M:%S"), found))
+        log.close()
     rows = [row for job in jobs for row in job.rows]
     # A limit applies to the combined tailnet result, not independently to every host.
     data = [row for row in rows if "error" not in row][:limit]
@@ -1147,10 +1238,7 @@ def render_file_results(operation, rows, errors, skipped, stats, as_json, verbos
         return
     if rows:
         for row in rows:
-            if operation == "grep":
-                print("%s:%s:%s: %s" % (row["node"], row["path"], row["line"], row["text"]))
-            else:
-                print("%s: %s" % (row["node"], row["path"]))
+            print(result_line(operation, row))
     else:
         print("no matches")
     for row in errors:
@@ -1862,15 +1950,27 @@ def file_main(argv):
         parser.add_argument("--timeout", type=float, default=FILE_TIMEOUT, metavar="SEC",
                             help="give up on a host after SEC seconds, keeping what it found "
                                  "(default %(default)g, 0: no limit)")
+        parser.add_argument("--live", action="store_true",
+                            help="show results while searching: a progress line per host and the first "
+                                 "--top results, redrawn in place; every result also goes to a log file "
+                                 "(--log) as soon as it is found. Ctrl-C stops and prints what was found")
+        parser.add_argument("--top", type=int, default=5, metavar="N",
+                            help="with --live, how many results to keep on screen (default %(default)s)")
+        parser.add_argument("--log", metavar="FILE",
+                            help="append every result to FILE as soon as it is found (follow it with "
+                                 "`tail -f`); default with --live: ~/.cache/tailmon/<search|grep>-<time>.log")
         parser.add_argument("-v", "--verbose", action="count", default=0,
                             help="-v: per-host summary; -vv: also a live progress bar per host with "
                                  "the path being searched (extra network traffic)")
 
-    search = sub.add_parser("search", help="find files by name")
+    search = sub.add_parser("search", help="find files and directories by name")
     common(search)
-    search.add_argument("path", nargs="?", default=".", help="root directory on each host")
-    search.add_argument("--name", default="*", help="filename glob, e.g. '*.log'")
-    search.add_argument("-i", "--ignore-case", action="store_true", help="match the --name glob case-insensitively")
+    search.add_argument("path", nargs="?", default=".",
+                        help="root directory on each host; without --name, a bare word such as "
+                             "'Marques' (no '/', not starting with '.' or '~') is the name to find in .")
+    search.add_argument("--name", help="filename glob, e.g. '*.log'; text without * ? [ matches anywhere "
+                                       "in the name ('Marques' = '*Marques*'). Default: everything")
+    search.add_argument("-i", "--ignore-case", action="store_true", help="match the name case-insensitively")
 
     grep = sub.add_parser("grep", help="search file contents with a regular expression")
     common(grep)
@@ -1884,15 +1984,35 @@ def file_main(argv):
         ap.error("choose 'search' or 'grep'")
     if a.max_results < 1:
         ap.error("--max-results must be at least 1")
+    if a.top < 0:
+        ap.error("--top must be 0 or more")
     cfg = load_config()
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
     exclude = set(x for x in a.exclude.split(",") if x) if a.exclude else set()
-    pattern = a.name if a.operation == "search" else a.pattern
+    if a.operation == "search":
+        if a.name is None and "/" not in a.path and not a.path.startswith((".", "~")):
+            a.name, a.path = a.path, "."  # `tailmon search Marques`: a name, not a directory
+        pattern = a.name if a.name is not None else "*"
+        if not any(ch in pattern for ch in "*?["):
+            pattern = "*%s*" % pattern  # like fd and locate: a plain word matches part of the name
+    else:
+        pattern = a.pattern
+    log = None
+    if a.log or a.live:
+        try:
+            log = open_log(a.log, a.operation, ["%s" % a.operation] + argv[1:])
+        except OSError as exc:
+            ap.error("cannot write the log: %s" % exc)
+        if not a.json:
+            print("results also go to %s" % log.name, file=sys.stderr)
     rows, errors, skipped, stats = file_tool(cfg, only, a.operation, a.path, pattern,
                                               a.max_results, a.hidden,
                                               getattr(a, "ignore_case", False),
                                               getattr(a, "fixed_strings", False),
-                                              a.verbose, a.timeout, a.proc, a.boom, exclude)
+                                              a.verbose, a.timeout, a.proc, a.boom, exclude,
+                                              (a.top or -1) if a.live else 0, log)
+    if log:
+        print("all results: %s" % log.name, file=sys.stderr)
     render_file_results(a.operation, rows, errors, skipped, stats, a.json, a.verbose)
 
 

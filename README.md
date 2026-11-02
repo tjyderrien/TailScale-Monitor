@@ -286,6 +286,8 @@ script once (`tailmon gate approve`).
 
 ```sh
 tailmon search /var/log --name '*.log'            # find matching files on every peer
+tailmon search Marques -i                         # names containing 'marques', any case, under ~
+tailmon search Marques -i --live                  # first 5 results on screen as they come, all in a log
 tailmon grep 'ERROR|WARN' /var/log -i             # grep file contents across the tailnet
 tailmon search /media --name '*.pdf' -vv --timeout 0  # live progress, no time limit
 tailmon search ~/Documents --name '*invoice*' -i     # case-insensitive: also Invoice.PDF
@@ -302,6 +304,13 @@ lifts this guard) by default, limit output to 1,000 results, and only search onl
 as needed (`--exclude biatri-1` leaves out a host whose huge disks would make everyone wait; the `exclude`
 config key does it for good). `grep`
 uses Python regular expressions; use `--fixed-strings` for literal text.
+`search` matches files and directories (shown with a trailing `/`); a `--name` without `*`, `?` or `[`
+matches anywhere in the name, and `-i` ignores case.
+
+`--live` shows results without waiting for the slowest host: a progress line per host and the first
+5 results (`--top N`), redrawn in place, while every result is appended to a log the moment it is found
+(`--log FILE`, default `~/.cache/tailmon/search-<time>.log`; follow it with `tail -f`). Ctrl-C stops all
+hosts and still prints what was found. `--log` also works without `--live`.
 
 Each host gets 300 seconds (`--timeout SEC`, `0` for no limit); a host that runs out of time keeps what
 it found so far, and the error says which path it was reading. `-v` prints a per-host summary (matches,
