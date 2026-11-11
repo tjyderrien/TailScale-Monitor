@@ -18,7 +18,7 @@ server-1         64 cores  load 0.10 0.07 0.07
 
 - **Zero install on the monitored hosts.** Hosts are discovered with `tailscale status --json`; each online
   Linux peer is probed over SSH by piping a small, standard-library-only Python script to `python3 -`.
-  Nothing is copied or left behind. The local machine is probed directly.
+  Nothing is copied or left behind. The local machine is probed directly, and may also be a Mac.
 - **Single file, no dependencies.** Just Python 3 and the `tailscale` and `ssh` CLIs.
 - **Live view.** `-w 1` keeps one SSH session per host open and streams a sample every second. Hosts that
   join or leave the tailnet are picked up automatically, and dropped connections are retried.
@@ -333,6 +333,7 @@ Nothing is required: with no config file, tailmon connects to each host the way 
 | TEMP   | `/sys/class/hwmon` (`/sys/class/thermal` if empty) and `nvidia-smi`: hottest reading per chip, against its limit |
 | IO     | `/proc/diskstats` (physical disks only) and `/proc/net/dev` (excluding `lo`, docker, veth, bridges, tailscale) |
 | HDD    | `statvfs` on local filesystems ≥ 1 GiB (ext*, xfs, btrfs, zfs, …), with inode usage when the FS reports it, plus a per-host total |
+| (Mac)  | when tailmon itself runs on macOS, the local machine is probed too: CPU from `host_statistics`, RAM from `vm_stat` (used = app memory + wired + compressed, as in Activity Monitor), IO from `ioreg` and `netstat -ibn`, HDD from `mount` (an APFS container counted once) |
 | TOTAL  | storage summed over all hosts, shown only when at most one Linux host is offline or unreachable (then marked incomplete). Excluded and non-Linux peers don't count |
 | USERS  | `who`: interactive logins; people other than the SSH user are highlighted                        |
 | SLURM  | `sinfo` / `squeue`, when installed (refreshed at most every 10 s): node state and CPU allocation, then the job queue. Hosts reporting the same cluster show it once |

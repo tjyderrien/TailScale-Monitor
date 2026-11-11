@@ -279,6 +279,76 @@ def slurm():
     slurm_cache[1] = {"nodes": nodes, "jobs": jobs}
     return slurm_cache[1]
 
+if sys.platform == "darwin":  # macOS has no /proc: the same numbers from mach, sysctl, vm_stat, ioreg, netstat, mount
+    import ctypes, plistlib, re
+    libc = ctypes.CDLL("/usr/lib/libSystem.dylib")
+    mach_host = libc.mach_host_self()  # once: every call adds a port reference
+
+    def cpu_times():
+        ticks, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)  # HOST_CPU_LOAD_INFO: user, system, idle, nice
+        libc.host_statistics(mach_host, 3, ticks, ctypes.byref(count))
+        return sum(ticks), ticks[2]
+
+    def disks_io():
+        r = w = 0
+        try:
+            drivers = plistlib.loads(subprocess.run(["ioreg", "-a", "-r", "-d", "1", "-c", "IOBlockStorageDriver"],
+                                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                                    timeout=10).stdout or b"<array/>")
+        except Exception:
+            return 0, 0
+        for d in drivers:
+            st = d.get("Statistics") or {}
+            r += st.get("Bytes (Read)", 0); w += st.get("Bytes (Write)", 0)
+        return r, w
+
+    def net_io():
+        rx = tx = 0
+        for line in (run(["netstat", "-ibn"]) or "").splitlines()[1:]:  # -n: no DNS lookups (they take seconds)
+            p = line.split()
+            # one <Link#n> row per interface holds its totals (the others repeat them per address)
+            if len(p) < 10 or not p[2].startswith("<Link#") or \
+                    p[0].rstrip("*").startswith(("lo", "utun", "bridge", "awdl", "llw", "gif", "stf", "anpi", "ap")):
+                continue
+            rx += int(p[-5]); tx += int(p[-2])
+        return rx, tx
+
+    def meminfo():
+        out = run(["vm_stat"]) or ""
+        page = int((re.search(r"page size of (\d+)", out) or [0, 4096])[1])
+        v = {k.strip('"'): int(n) * page for k, n in re.findall(r"^([^:]+):\s+(\d+)\.", out, re.M)}
+        total = int(run(["sysctl", "-n", "hw.memsize"]) or 0)
+        # like Activity Monitor's "Memory Used": app memory + wired + compressed
+        used = v.get("Anonymous pages", 0) - v.get("Pages purgeable", 0) + v.get("Pages wired down", 0) + \
+            v.get("Pages occupied by compressor", 0)
+        sw = dict(re.findall(r"(total|used) = ([\d.]+)M", run(["sysctl", "-n", "vm.swapusage"]) or ""))
+        return {"total": total, "used": min(max(used, 0), total),
+                "swap_total": int(float(sw.get("total", 0)) * 2**20), "swap_used": int(float(sw.get("used", 0)) * 2**20)}
+
+    def filesystems():
+        out, seen = [], set()
+        for line in (run(["mount"]) or "").splitlines():
+            m = re.match(r"(\S+) on (.+) \((\w+)", line)
+            if not m or m.group(3) not in ("apfs", "hfs", "exfat", "msdos", "ntfs", "ufs"):
+                continue
+            dev, mnt, fstype = m.groups()
+            # the volumes of an APFS container (disk3s1, disk3s5, ...) share its space: count it once
+            key = re.sub(r"s\d+(s\d+)?$", "", dev) if fstype == "apfs" else dev
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                s = os.statvfs(mnt)
+            except OSError:
+                continue
+            total = s.f_blocks * s.f_frsize
+            if total < 1 << 30:
+                continue
+            out.append({"mount": mnt, "total": total, "used": total - s.f_bfree * s.f_frsize,
+                        "free": s.f_bavail * s.f_frsize,
+                        "inodes_total": s.f_files, "inodes_used": s.f_files - s.f_ffree})
+        return out
+
 def counters():
     return time.time(), cpu_times(), disks_io(), net_io()
 
@@ -478,15 +548,30 @@ def load_config():
     return cfg
 
 
+def tailscale_exe():
+    """The tailscale CLI: on the PATH, or inside the macOS app bundle (which does not put it on the PATH)."""
+    exe = shutil.which("tailscale")
+    if exe:
+        return exe
+    for path in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                 os.path.expanduser("~/Applications/Tailscale.app/Contents/MacOS/Tailscale")):
+        if os.access(path, os.X_OK):
+            return path
+    sys.exit("tailmon: tailscale CLI not found (install it, or add it to the PATH)")
+
+
 def discover():
     """Return (self_node, [peer nodes]) from tailscale; each node is a dict."""
-    st = json.loads(subprocess.run(["tailscale", "status", "--json"], check=True,
+    st = json.loads(subprocess.run([tailscale_exe(), "status", "--json"], check=True,
                                    stdout=subprocess.PIPE).stdout)
 
     def node(p):
         return {"name": p["DNSName"].split(".")[0] or p["HostName"], "dns": p["DNSName"].rstrip("."),
                 "ip": (p.get("TailscaleIPs") or [None])[0], "os": p.get("OS", ""), "online": p.get("Online", False)}
     return node(st["Self"]), [node(p) for p in (st.get("Peer") or {}).values()]
+
+
+PROBE_SELF_OSES = ("linux", "macOS")  # the probe also reads a Mac, but only this one: remote Macs are not probed
 
 
 def gated(node, cfg):
@@ -548,10 +633,18 @@ def probe(node, cfg, is_self):
     return json.loads(r.stdout)
 
 
-def targets_for(cfg, only=None, exclude=(), oses=("linux",)):
-    """Return ([(node, is_self)], [skipped nodes]); `exclude` also drops this machine if it is named."""
+def targets_for(cfg, only=None, exclude=(), oses=("linux",), self_oses=None):
+    """Return ([(node, is_self)], [skipped nodes]); `exclude` also drops this machine if it is named.
+
+    This machine is a target only when its OS is in `self_oses` (default: `oses`), since it runs the same
+    scripts locally; e.g. the probe and the file walker also run on a Mac, the volume script does not."""
     me, peers = discover()
-    targets, skipped = ([] if me["name"] in exclude else [(me, True)]), []
+    targets, skipped = [], []
+    if me["name"] not in exclude:
+        if me["os"] in (oses if self_oses is None else self_oses):
+            targets.append((me, True))
+        elif not only or me["name"] in only:
+            skipped.append(me)
     for p in peers:
         if only and p["name"] not in only:
             continue
@@ -567,7 +660,7 @@ def targets_for(cfg, only=None, exclude=(), oses=("linux",)):
 
 
 def collect(cfg, only=None):
-    targets, skipped = targets_for(cfg, only)
+    targets, skipped = targets_for(cfg, only, self_oses=PROBE_SELF_OSES)
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         futs = [(n, ex.submit(probe, n, cfg, s)) for n, s in targets]
         results = [dict(f.result(), node=n["name"]) for n, f in futs]
@@ -1186,7 +1279,7 @@ def draw(results, skipped, live):
 
 def rediscover(streams, logged, cfg, only, interval):
     """Start streams for newly seen hosts and stop those that went away; return the skipped list."""
-    targets, skipped = targets_for(cfg, only)
+    targets, skipped = targets_for(cfg, only, self_oses=PROBE_SELF_OSES)
     names = {n["name"] for n, _ in targets}
     for name in set(streams) - names:
         streams.pop(name).stop()
