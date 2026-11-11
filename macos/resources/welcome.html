@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<style>
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; line-height: 1.45; margin: 0 4px; }
+  h1 { font-size: 17px; margin: 0 0 10px; }
+  li { margin-bottom: 4px; }
+  code { font: 12px ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<h1>Welcome to tailmon</h1>
+<p>tailmon shows the CPU, GPU, RAM, IO, disk and temperature of the machines on your Tailscale tailnet, and
+finds, searches and opens files on all of them at once. Nothing is installed on the machines it watches.</p>
+<p>This installer adds:</p>
+<ul>
+  <li>the <code>tailmon</code> command, in <code>/usr/local/bin</code>;</li>
+  <li>its manual page (<code>man tailmon</code>);</li>
+  <li>optionally, the <code>tailscale</code> command, if the Tailscale app is installed without it.</li>
+</ul>
+<p>You will also need:</p>
+<ul>
+  <li>Tailscale, signed in to your tailnet;</li>
+  <li>SSH access by key (no password prompt) to the machines you want to watch;</li>
+  <li>Python 3. If it is missing, macOS offers to install the Command Line Tools after this installation.</li>
+</ul>
+</body>
+</html>

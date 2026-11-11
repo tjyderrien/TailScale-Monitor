@@ -1,0 +1,22 @@
+# Builds the graphical macOS installer. Run it from the Actions tab ("Run workflow"), or push a tag v*;
+# the .pkg is attached to the run as the "tailmon-macos-pkg" artifact.
+name: macOS installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pkg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          case "$GITHUB_REF" in refs/tags/v*) export VERSION="${GITHUB_REF#refs/tags/v}" ;; esac
+          sh macos/build-pkg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailmon-macos-pkg
+          path: macos/build/*.pkg

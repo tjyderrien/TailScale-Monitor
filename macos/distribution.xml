@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>tailmon</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="allow" require-scripts="false" hostArchitectures="x86_64,arm64"/>
+    <domains enable_localSystem="true"/>
+
+    <choices-outline>
+        <line choice="tailmon"/>
+        <line choice="tailscale-cli"/>
+    </choices-outline>
+
+    <choice id="tailmon" title="tailmon" enabled="false" selected="true"
+            description="The tailmon command (/usr/local/bin/tailmon) and its manual page. If Python 3 is missing, macOS offers to install the Command Line Tools.">
+        <pkg-ref id="io.github.tjyderrien.tailmon"/>
+    </choice>
+    <choice id="tailscale-cli" title="tailscale command" start_selected="true"
+            description="tailmon runs the tailscale command. If the Tailscale app is installed and its command is not, add /usr/local/bin/tailscale, which runs the app's command. Nothing is changed otherwise.">
+        <pkg-ref id="io.github.tjyderrien.tailmon.tailscale-cli"/>
+    </choice>
+
+    <pkg-ref id="io.github.tjyderrien.tailmon" version="@VERSION@" onConclusion="none">tailmon-core.pkg</pkg-ref>
+    <pkg-ref id="io.github.tjyderrien.tailmon.tailscale-cli" version="@VERSION@" onConclusion="none">tailscale-cli.pkg</pkg-ref>
+</installer-gui-script>

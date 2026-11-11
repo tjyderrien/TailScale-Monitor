@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<style>
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; line-height: 1.45; margin: 0 4px; }
+  h1 { font-size: 17px; margin: 0 0 10px; }
+  pre { font: 12px ui-monospace, Menlo, monospace; padding: 8px 10px; border-radius: 6px;
+        background: rgba(127, 127, 127, 0.12); margin: 6px 0 12px; }
+  code { font: 12px ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<h1>tailmon is installed</h1>
+<p>Open Terminal and try:</p>
+<pre>tailmon           # one snapshot of every machine
+tailmon -w 1      # live view, refreshed every second
+man tailmon       # the manual</pre>
+<p>If macOS asked to install the Command Line Tools, let it finish first: they provide Python 3.</p>
+<p>To watch this Mac's files from other machines, or to use <code>search</code>, <code>grep</code> and
+<code>mount</code> on it, turn on <b>Remote Login</b> in System Settings → General → Sharing.</p>
+<p>To uninstall:</p>
+<pre>sudo /usr/local/share/tailmon/uninstall.sh</pre>
+</body>
+</html>

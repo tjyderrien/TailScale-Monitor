@@ -1,0 +1,14 @@
+#!/bin/sh
+# tailmon runs with `python3`. On a fresh Mac /usr/bin/python3 is only a stub until the Command Line Tools
+# are installed: if no real Python 3 is found, open the macOS dialog that installs them.
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+         /Library/Frameworks/Python.framework/Versions/Current/bin/python3; do
+    [ -x "$p" ] && exit 0
+done
+xcode-select -p >/dev/null 2>&1 && exit 0
+
+user=$(stat -f %Su /dev/console 2>/dev/null)
+if [ -n "$user" ] && [ "$user" != root ]; then
+    launchctl asuser "$(id -u "$user")" sudo -u "$user" xcode-select --install >/dev/null 2>&1 || true
+fi
+exit 0

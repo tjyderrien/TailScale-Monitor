@@ -65,6 +65,11 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-hosts
 .IR LIST ]
 .RB [ \-\-json ]
+.br
+.B tailmon gate
+.BR install | approve | status | remove | hashes
+.RB [ \-\-hosts
+.IR LIST ]
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -117,10 +122,29 @@ to keep a history.
 .B \-\-quiet
 Do not draw the table. Meant for use with
 .B \-\-log
+or
+.B \-\-alert
 from
 .BR cron (8)
 or
 .BR systemd (1).
+.TP
+.BI \-\-alert " CMD"
+Run the shell command
+.I CMD
+each time a temperature sensor reaches its limit (once, until it cools down and heats up again).
+Its environment holds
+.BR TAILMON_HOST ,
+.BR TAILMON_SENSOR ,
+.BR TAILMON_CHIP ,
+.B TAILMON_KIND
+(cpu, gpu, disk, other),
+.BR TAILMON_TEMP ,
+.B TAILMON_LIMIT
+and
+.BR TAILMON_LEVEL .
+In snapshot mode it runs for every hot sensor. See
+.BR TEMP " under " OUTPUT .
 .TP
 .BI \-\-hosts " LIST"
 Only probe these comma\-separated Tailscale hostnames.
@@ -266,7 +290,9 @@ a step
 .RB ( +5 ", " \-5 ),
 .BR mute ", " unmute " or " toggle .
 The default output is driven with
-.BR wpctl ", " pactl " or " amixer ,
+.BR wpctl ", " pactl ", " amixer
+or, on macOS,
+.BR osascript ,
 whichever works, so the user's sound server must be running.
 Windows hosts (with the OpenSSH server) are driven through PowerShell and the Core Audio API;
 Android hosts need Termux with sshd, python and Termux:API, and get their media volume set.
@@ -298,7 +324,7 @@ header).
 Hosts to offer, as for
 .BR volume .
 .SS "mount"
-Mount each online Linux peer with
+Mount each online Linux and macOS peer with
 .BR sshfs (1)
 at
 .IB ROOT / host
@@ -332,6 +358,75 @@ Only these comma\-separated Tailscale hostnames.
 Print
 .B {"results": [...], "skipped": [...]}
 instead of text.
+.SS "gate install|approve|status|remove|hashes"
+Let each host approve the scripts
+.B tailmon
+runs on it. Linux, macOS and Android (Termux) hosts; Windows hosts keep your normal login.
+.TP
+.B install
+Log in once with your normal key; create
+.B tailmon\(aqs
+own key
+.RB ( gate_key ,
+default
+.IR ~/.ssh/tailmon_gate )
+here if needed; on each host, copy the gate to
+.IR ~/.local/share/tailmon/gate.py ,
+approve this version\(aqs scripts (monitoring probe, file tool, volume) in
+.IR ~/.config/tailmon/approved ,
+back up
+.I ~/.ssh/authorized_keys
+to
+.I authorized_keys.before\-tailmon
+and add the key to it as
+.BR "restrict,command=\(dqPYTHON GATE\(dq" ,
+with the absolute path of the
+.B python3
+that the host\(aqs login shell finds. Then check that the key reaches the gate, and add the host to
+.BR gate_hosts .
+.TP
+.B approve
+Approve this version\(aqs scripts on the gated hosts (needed after updating
+.BR tailmon ).
+.TP
+.B status
+Ask each gate, with the gate key only, whether it runs this version\(aqs scripts.
+.TP
+.B remove
+Delete the key line and the gate from the hosts and take them out of
+.BR gate_hosts .
+.TP
+.B hashes
+Print the SHA\-256 of this version\(aqs scripts, to approve them by hand.
+.TP
+.BI \-\-hosts " LIST"
+Default: every online Linux, macOS and Android host for
+.BR install ,
+the gated hosts otherwise.
+.PP
+The gate runs a script only when its SHA\-256 is approved. Anything else (a shell, another program, an
+unapproved script) exits with status 77 and is logged in
+.IR ~/.config/tailmon/gate.log ;
+.B restrict
+also forbids forwarding, agent and terminals.
+.B tailmon
+reaches gated hosts with the gate key only
+.RB ( IdentitiesOnly=yes ", " ControlPath=none )
+and a command that starts with
+.BR tailmon\-gate ,
+which only the gate accepts, so a host that lets in another key fails instead of running the script
+unchecked. On a host, its owner can run
+.B gate.py list
+(approved scripts, latest log),
+.BI "gate.py approve " SHA256
+.RI [ name ]
+and
+.BI "gate.py revoke " SHA256
+with the
+.B python3
+of the key line.
+.B mount
+keeps using your normal key: SFTP can\(aqt be narrowed down.
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8
@@ -346,7 +441,7 @@ and swap, from
 .IR /proc/meminfo .
 .TP
 .B GPU
-Per NVIDIA GPU: utilization, memory and temperature, when
+Per NVIDIA GPU: utilization and memory, when
 .BR nvidia\-smi (1)
 is available.
 .TP
@@ -360,6 +455,24 @@ Disk read/write throughput from
 .B HDD
 Usage of local filesystems of at least 1 GiB (ext*, xfs, btrfs, zfs, ...), with inode usage
 when the filesystem reports it, plus a per\-host total.
+.TP
+.B TEMP
+The hottest reading of each temperature sensor chip, from
+.I /sys/class/hwmon
+(or
+.I /sys/class/thermal
+when there is none) and
+.BR nvidia\-smi (1):
+CPU (CPU0, CPU1 per socket), GPU0 ..., disks by name (nvme0, sda) and board chips by driver name.
+Each is compared with the limit the sensor reports (its max, or crit \- 10), else 85\(deC for
+CPUs and GPUs, 65\(deC for disks and 80\(deC for the rest, or the
+.B temp_high
+setting. It is yellow within
+.B temp_warn_margin
+of the limit and red at it; such sensors are also listed, worst first, in a HOT or WARM line at
+the top. SATA disks report a temperature only with the kernel's
+.B drivetemp
+module loaded.
 .TP
 .B TOTAL
 Storage summed over all hosts. Shown only when at most one Linux host is offline or
@@ -392,7 +505,11 @@ overrides any of the built\-in defaults:
   "identity": "~/.ssh/id_ed25519",
   "exclude": ["printer\-pi"],
   "sample_seconds": 1.0,
-  "discover_seconds": 30.0
+  "discover_seconds": 30.0,
+  "temp_high": {"disk": 55, "nvme": 70},
+  "temp_warn_margin": 10.0,
+  "gate_key": "~/.ssh/tailmon_gate",
+  "gate_hosts": ["asus", "mac\-mini"]
 }
 .fi
 .RE
@@ -426,6 +543,23 @@ Measurement window for rates (CPU %, disk and network throughput) in snapshot mo
 In watch mode, how often to re\-run
 .B tailscale status
 to find new or departed hosts. Default 30.0.
+.TP
+.B temp_high
+Temperature limits in \(deC by sensor kind (cpu, gpu, disk, other) or chip name (nvme, coretemp,
+nvidia, acpitz, ...; a chip beats its kind). They replace the limit the sensor reports. Default {}.
+.TP
+.B temp_warn_margin
+A sensor turns yellow this many \(deC below its limit. Default 10.
+.TP
+.B gate_key
+.B tailmon\(aqs
+own SSH key for gated hosts. Default
+.IR ~/.ssh/tailmon_gate .
+.TP
+.B gate_hosts
+Hosts reached through their gate; kept up to date by
+.BR "tailmon gate install" " and " remove .
+Default [].
 .SH SSH
 .B tailmon
 runs
@@ -445,6 +579,8 @@ Connections use
 (never prompt for a password) and
 .BR StrictHostKeyChecking=accept\-new ,
 so key\-based, non\-interactive access is required.
+.SH EXIT STATUS
+A snapshot exits with status 3 when a temperature sensor is at or above its limit, 0 otherwise.
 .SH ENVIRONMENT
 .TP
 .B NO_COLOR
@@ -456,6 +592,13 @@ Optional configuration file.
 .TP
 .I ~/.ssh/config
 Per\-host SSH settings, honored as described above.
+.TP
+.I ~/.ssh/tailmon_gate
+The gate key (see
+.BR gate ).
+.TP
+.IR ~/.local/share/tailmon/gate.py ", " ~/.config/tailmon/approved ", " ~/.config/tailmon/gate.log
+On a gated host: the gate, its approved SHA\-256 list and its log.
 .SH REQUIREMENTS
 On the machine running
 .BR tailmon :
@@ -468,7 +611,14 @@ On each monitored host: Linux with
 .B python3
 3.6 or later on the
 .BR PATH ;
-optionally
+macOS hosts are not monitored, but
+.BR search ", " grep ", " mount ", " volume " and " gate
+work on them with Remote Login on and the Command Line Tools or Homebrew
+.BR python3 ;
+searching protected folders such as
+.I ~/Documents
+needs \(lqAllow full disk access for remote users\(rq in the Remote Login settings.
+Optionally on Linux:
 .BR nvidia\-smi (1),
 .BR who (1),
 .BR sinfo (1)
@@ -490,6 +640,9 @@ Machine\-readable snapshot.
 .TP
 .B tailmon \-w 60 \-\-log m.jsonl \-\-quiet
 Record one sample per host per minute without drawing, e.g.\& from a systemd service.
+.TP
+.B tailmon \-w 5 \-\-alert \(aqnotify\-send \-u critical "$TAILMON_HOST is hot" "$TAILMON_SENSOR $TAILMON_TEMP"\(aq
+Live view with a desktop notification when anything overheats.
 .TP
 .B tailmon search /var/log \-\-name \(aq*.log\(aq
 Find log files on every peer.

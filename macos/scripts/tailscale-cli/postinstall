@@ -1,0 +1,17 @@
+#!/bin/sh
+# tailmon runs `tailscale status --json`. The Tailscale app (App Store or standalone) ships the command inside
+# the app; if it isn't on the PATH yet, add a small wrapper in /usr/local/bin. Never replaces anything.
+app=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+[ -x "$app" ] || exit 0
+for p in /usr/local/bin/tailscale /opt/homebrew/bin/tailscale /usr/bin/tailscale; do
+    [ -e "$p" ] && exit 0
+done
+
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/tailscale <<EOF
+#!/bin/sh
+# Added by the tailmon installer: runs the Tailscale app's command-line interface.
+exec "$app" "\$@"
+EOF
+chmod 755 /usr/local/bin/tailscale
+exit 0
