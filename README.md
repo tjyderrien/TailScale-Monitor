@@ -63,10 +63,25 @@ mkdir -p ~/.local/bin && ln -s "$PWD/tailmon.py" ~/.local/bin/tailmon
 
 The examples below use `tailmon`; without the link, run `./tailmon.py` from the repository instead.
 
+### Tab completion
+
+`tailmon` then Tab lists the commands, then each command's options and arguments (and the Tailscale hostnames
+after `--hosts`). Enable it in your shell's startup file:
+
+```sh
+# ~/.zshrc (after compinit; add `autoload -U compinit && compinit` if your .zshrc has none)
+eval "$(tailmon completion zsh)"
+# ~/.bashrc
+eval "$(tailmon completion bash)"
+```
+
+The macOS installer already puts the zsh completion in `/usr/local/share/zsh/site-functions`, so zsh only needs
+`compinit`.
+
 ### macOS installer
 
 `macos/build-pkg.sh` (run on a Mac) builds `macos/build/tailmon-<version>.pkg`, a graphical installer that puts
-`tailmon` in `/usr/local/bin` with its man page, offers to install the Command Line Tools if Python 3 is
+`tailmon` in `/usr/local/bin` with its man page and zsh completion, offers to install the Command Line Tools if Python 3 is
 missing, and adds a `tailscale` command when the Tailscale app is installed without one. Without a Mac, run the
 *macOS installer* workflow from the GitHub Actions tab and download the `.pkg` from the run. Set `SIGN_ID` (and
 `NOTARY_PROFILE`) to sign and notarize it; an unsigned package opens with right-click → *Open*, or *Open Anyway*

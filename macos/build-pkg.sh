@@ -21,11 +21,14 @@ done
 
 rm -rf "$build"
 mkdir -p "$build/root/usr/local/bin" "$build/root/usr/local/share/man/man1" "$build/root/usr/local/share/tailmon" \
+         "$build/root/usr/local/share/zsh/site-functions" \
          "$build/resources" "$build/empty"
 
-# Payload: the script, its man page, the licence and an uninstaller.
+# Payload: the script, its man page, its zsh completion, the licence and an uninstaller.
 install -m 755 "$repo/tailmon.py" "$build/root/usr/local/bin/tailmon"
 install -m 644 "$repo/tailmon.1" "$build/root/usr/local/share/man/man1/tailmon.1"
+python3 "$repo/tailmon.py" completion zsh > "$build/root/usr/local/share/zsh/site-functions/_tailmon"
+chmod 644 "$build/root/usr/local/share/zsh/site-functions/_tailmon"
 install -m 644 "$repo/LICENSE" "$build/root/usr/local/share/tailmon/LICENSE"
 install -m 755 "$here/uninstall.sh" "$build/root/usr/local/share/tailmon/uninstall.sh"
 chmod 755 "$here/scripts/core/postinstall" "$here/scripts/tailscale-cli/postinstall"

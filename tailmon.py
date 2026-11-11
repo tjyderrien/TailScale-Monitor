@@ -2304,7 +2304,130 @@ def tasks_main(argv):
                                            cost, r["task"][:90], "  [closed]" if r["completed"] else ""))
 
 
+ZSH_COMPLETION = r'''#compdef tailmon
+# zsh completion for tailmon: `tailmon completion zsh`
+
+_tailmon_hosts() {
+    local -a hosts
+    hosts=(${(f)"$(tailscale status 2>/dev/null | awk '$1 ~ /^[0-9]/ {print $2}')"})
+    _sequence compadd -a hosts
+}
+
+_tailmon() {
+    local -a commands common
+    commands=(
+        'search:find files by name on every host'
+        'grep:search file contents with a regular expression'
+        'volume:show or change the sound volume of the hosts'
+        'serve:web page and JSON API to control the volume'
+        'mount:sshfs-mount every peer, one directory per host'
+        'umount:unmount what tailmon mount mounted'
+        'gate:let each host approve the scripts tailmon runs on it'
+        'tasks:the Todoist tasks each host ran'
+        'completion:print a shell completion script'
+    )
+    if (( CURRENT == 2 )) && [[ $words[2] != -* ]]; then
+        _describe -t commands 'tailmon command' commands
+        return
+    fi
+    if [[ $words[2] == -* ]]; then  # the monitor itself: options only
+        _arguments '(-w --watch)'{-w,--watch}'[refresh every SEC seconds]:seconds' \
+            '--json[print a JSON snapshot and exit]' '--log[append each sample to FILE]:file:_files' \
+            '--hosts[comma-separated hostnames]:hosts:_tailmon_hosts' \
+            '--quiet[do not draw the table]' '--alert[command run when a temperature is too high]:command' \
+            '(-h --help)'{-h,--help}'[show help]'
+        return
+    fi
+    local cmd=$words[2]
+    (( CURRENT-- )); shift words
+    common=('(-h --help)'{-h,--help}'[show help]' '--hosts[comma-separated hostnames]:hosts:_tailmon_hosts')
+    case $cmd in
+    search|grep)
+        common+=('--exclude[hostnames not to search]:hosts:_tailmon_hosts' '--max-results[maximum results]:N'
+                 '--hidden[include hidden files]' '--proc[also walk into /proc]' '--boom[disable the loop guard]'
+                 '--json[print JSON]' '--timeout[give up on a host after SEC seconds]:seconds'
+                 '*'{-v,--verbose}'[per-host summary; -vv: progress]'
+                 '(-i --ignore-case)'{-i,--ignore-case}'[ignore case]')
+        if [[ $cmd == search ]]; then
+            _arguments $common '--name[filename glob]:glob' '1:root directory on each host:_files -/'
+        else
+            _arguments $common '--fixed-strings[pattern is literal text]' '1:pattern' \
+                '2:root directory on each host:_files -/'
+        fi ;;
+    volume)
+        _arguments $common '--exclude[hostnames to leave alone]:hosts:_tailmon_hosts' '--json[print JSON]' \
+            '1:level:(mute unmute toggle +5 -5 25 50 75 100)' ;;
+    serve)
+        _arguments $common '--exclude[hostnames to leave out]:hosts:_tailmon_hosts' '--bind[address]:address' \
+            '--port[port]:port' '--token[require this token]:token' ;;
+    mount|umount)
+        common+=('--root[local directory holding one mount per host]:directory:_files -/' '--json[print JSON]')
+        [[ $cmd == mount ]] && common+=('--path[remote directory to mount]:path')
+        _arguments $common ;;
+    gate)
+        _arguments $common '1:action:((install\:"set up the gate on the hosts"
+            approve\:"approve this version of the scripts" status\:"ask every gate whether it would run this tailmon"
+            remove\:"take the gate off the hosts" hashes\:"print the SHA-256 of the scripts"))' ;;
+    tasks)
+        _arguments $common '(-n --last)'{-n,--last}'[tasks shown per host]:N' '--days[days of completed tasks]:days' \
+            '--label[dispatch label]:label' '--json[print JSON]' ;;
+    completion)
+        _arguments '1:shell:(zsh bash)' ;;
+    esac
+}
+
+if [[ $zsh_eval_context[-1] == loadautofunc ]]; then
+    _tailmon "$@"
+else
+    compdef _tailmon tailmon
+fi
+'''
+
+BASH_COMPLETION = r'''# bash completion for tailmon: `tailmon completion bash`
+_tailmon() {
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words
+    if [[ $prev == --hosts || $prev == --exclude ]]; then
+        local done=${cur%"${cur##*,}"}
+        COMPREPLY=($(compgen -P "$done" -W "$(tailscale status 2>/dev/null | awk '$1 ~ /^[0-9]/ {print $2}')" \
+                     -- "${cur##*,}"))
+        compopt -o nospace 2>/dev/null
+        return
+    fi
+    if (( COMP_CWORD == 1 )); then
+        words="search grep volume serve mount umount gate tasks completion"
+        [[ $cur == -* ]] && words="-w --watch --json --log --hosts --quiet --alert --help"
+    else
+        case ${COMP_WORDS[1]} in
+        search) words="--name -i --ignore-case --hosts --exclude --max-results --hidden --proc --boom --json --timeout -v --verbose --help" ;;
+        grep) words="--fixed-strings -i --ignore-case --hosts --exclude --max-results --hidden --proc --boom --json --timeout -v --verbose --help" ;;
+        volume) words="mute unmute toggle +5 -5 --hosts --exclude --json --help" ;;
+        serve) words="--bind --port --token --hosts --exclude --help" ;;
+        mount) words="--root --path --hosts --json --help" ;;
+        umount) words="--root --hosts --json --help" ;;
+        gate) words="install approve status remove hashes --hosts --help" ;;
+        tasks) words="-n --last --hosts --days --label --json --help" ;;
+        completion) words="zsh bash" ;;
+        esac
+    fi
+    COMPREPLY=($(compgen -W "$words" -- "$cur"))
+}
+complete -o default -F _tailmon tailmon
+'''
+
+
+def completion_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon completion",
+                                 description="Print a shell completion script. zsh: add "
+                                             "`eval \"$(tailmon completion zsh)\"` to ~/.zshrc (after compinit); "
+                                             "bash: `eval \"$(tailmon completion bash)\"` in ~/.bashrc")
+    ap.add_argument("shell", choices=("zsh", "bash"))
+    a = ap.parse_args(argv[1:])
+    sys.stdout.write(ZSH_COMPLETION if a.shell == "zsh" else BASH_COMPLETION)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "completion":
+        return completion_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in ("search", "grep"):
         return file_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in ("mount", "umount"):

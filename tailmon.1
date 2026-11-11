@@ -70,6 +70,9 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .BR install | approve | status | remove | hashes
 .RB [ \-\-hosts
 .IR LIST ]
+.br
+.B tailmon completion
+.BR zsh | bash
 .SH DESCRIPTION
 .B tailmon
 shows CPU, memory, GPU, disk and network throughput, filesystem usage, logged\-in users
@@ -427,6 +430,25 @@ with the
 of the key line.
 .B mount
 keeps using your normal key: SFTP can\(aqt be narrowed down.
+.SS "completion zsh|bash"
+Print a completion script, so that
+.B tailmon
+followed by Tab lists the subcommands, then their options and arguments (and, after
+.BR \-\-hosts ,
+the Tailscale hostnames). For zsh, add
+.B eval "$(tailmon completion zsh)"
+to
+.I ~/.zshrc
+after
+.BR compinit ;
+for bash, add
+.B eval "$(tailmon completion bash)"
+to
+.IR ~/.bashrc .
+The macOS installer puts the zsh one in
+.IR /usr/local/share/zsh/site\-functions/_tailmon ,
+already on zsh's
+.BR fpath .
 .SH OUTPUT
 For each host the table shows a header line (name, core count, load average) followed by:
 .TP 8

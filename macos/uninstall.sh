@@ -5,7 +5,7 @@ set -e
 if [ "$(id -u)" != 0 ]; then
     exec sudo "$0" "$@"
 fi
-rm -f /usr/local/bin/tailmon /usr/local/share/man/man1/tailmon.1
+rm -f /usr/local/bin/tailmon /usr/local/share/man/man1/tailmon.1 /usr/local/share/zsh/site-functions/_tailmon
 if grep -q "Added by the tailmon installer" /usr/local/bin/tailscale 2>/dev/null; then
     rm -f /usr/local/bin/tailscale
 fi
