@@ -248,8 +248,8 @@ tailmon tasks --json             # with session IDs, folders, start and end time
 ```
 
 Lists the tasks that [`claude-explorer dispatch`](https://github.com/tjyderrien/ClaudeXplorer) handed to
-Claude Code agents, grouped by host, newest first, with their state (`running`, `done`, `failed`, `limit`)
-and cost. Tailnet hosts that ran nothing are listed as `no task`. The data comes from the comments dispatch
+Claude Code agents, grouped by host, newest first, with their state (`running`, `done`, `failed`, `limit`),
+cost, and the Claude session (its hash, as in `claude-explorer`) and folder the agent worked in. Tailnet hosts that ran nothing are listed as `no task`. The data comes from the comments dispatch
 posts on each task ("Agent started on …", "Agent on …"), for open tasks labelled `@claude-running`,
 `@claude-done` or `@claude-failed`, and for tasks you ticked off in the last `--days` days (default 60,
 shown as `[closed]`).

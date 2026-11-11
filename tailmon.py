@@ -2300,8 +2300,9 @@ def tasks_main(argv):
         print("%s  %s" % (h, "%d run(s)" % len(rs) if rs else "no task"))
         for r in rs[:a.last]:
             cost = "$%.2f" % r["cost"] if r["cost"] is not None else ""
-            print("  %s  %s  %-5s  %s%s" % (local_time(r["started"]), c("%-7s" % r["state"], colors[r["state"]]),
-                                           cost, r["task"][:90], "  [closed]" if r["completed"] else ""))
+            print("  %s  %s  %-5s  %s  %s: %s%s" % (local_time(r["started"]), c("%-7s" % r["state"], colors[r["state"]]),
+                                                   cost, r["session"][:8], r["dir"], r["task"][:90],
+                                                   "  [closed]" if r["completed"] else ""))
 
 
 ZSH_COMPLETION = r'''#compdef tailmon
