@@ -597,6 +597,17 @@ and
 .BR squeue (1),
 when installed (refreshed at most every 10 seconds). Hosts reporting the same cluster show it once.
 .TP
+.B POWER
+Each host\(aqs header line shows its power and the energy and cost of 24 hours at that rate (the
+mean of the readings so far in a live view), and a POWER line sums all hosts. The power is read from
+the server\(aqs ACPI power meter, or from a laptop\(aqs battery while it discharges; otherwise it is
+estimated, and marked \(ap: a base for the chassis (laptop 4 W, desktop 25 W, server 60 W), each CPU
+package\(aqs rated power (RAPL PL1) scaled by load, 0.15 W per GB of RAM, 6 W per hard disk, 2 W per
+SSD and the NVIDIA GPUs\(aq reading, divided by 0.88 for the power supply. See
+.BR kwh_price ", " currency " and " power
+under
+.BR CONFIGURATION .
+.TP
 .B FLOWS
 With
 .B \-\-flows
@@ -686,6 +697,16 @@ own SSH key for gated hosts. Default
 Hosts reached through their gate; kept up to date by
 .BR "tailmon gate install" " and " remove .
 Default [].
+.TP
+.B kwh_price
+Price of a kWh, all in, for the electricity cost per 24 hours. Default 6.0.
+.TP
+.B currency
+Its currency. Default "CZK".
+.TP
+.B power
+Power in W of hosts measured by hand (e.g.\& with a plug meter), replacing tailmon\(aqs reading or
+estimate. Default {}.
 .TP
 .B flows
 Show the

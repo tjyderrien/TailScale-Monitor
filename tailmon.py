@@ -59,13 +59,88 @@ DEFAULT_CONFIG = {
     # Traffic between the hosts (FLOWS section) in the monitor, as with --flows. Off by default: each probe
     # then also runs `ss` and `tailscale status` every sample.
     "flows": False,
+    # Electricity cost next to each host: price of a kWh (all in: energy, distribution, taxes) and its
+    # currency, and the power of hosts you measured yourself (e.g. with a plug meter), in W, which then
+    # replaces tailmon's reading or estimate.
+    "kwh_price": 6.0,
+    "currency": "CZK",
+    "power": {},
 }
+
+# ---------------------------------------------------------------------------------------------
+# Power: what each machine draws, for its electricity cost. Pasted into the probe and the htop script.
+# Measured when the machine can tell (a server's power meter, a laptop on battery), estimated otherwise.
+# ---------------------------------------------------------------------------------------------
+POWER = r'''
+def sysfs(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+# Estimate: a base for the chassis (board, fans, BMC, NICs), each CPU package's rated power (RAPL's PL1,
+# readable without root) scaled by load, RAM, disks, the GPUs' own reading, then PSU losses.
+POWER_BASE = {"laptop": 4.0, "desktop": 25.0, "server": 60.0, "mac": 4.0}
+POWER_CHASSIS = {"8": "laptop", "9": "laptop", "10": "laptop", "11": "laptop", "14": "laptop", "30": "laptop",
+                 "31": "laptop", "32": "laptop", "17": "server", "23": "server", "25": "server", "28": "server",
+                 "29": "server"}  # SMBIOS chassis types
+power_info = {}
+
+def power_setup():
+    import glob
+    i = power_info
+    i["kind"] = POWER_CHASSIS.get(sysfs("/sys/class/dmi/id/chassis_type"), "desktop")
+    i["tdp"] = [int(sysfs(d + "/constraint_0_power_limit_uw", "0") or 0) / 1e6
+                for d in sorted(glob.glob("/sys/class/powercap/intel-rapl:[0-9]"))]
+    i["tdp"] = [t for t in i["tdp"] if t > 0] or [min(250.0, max(15.0, 4.0 * (os.cpu_count() or 1)))]
+    i["hdd"] = i["ssd"] = 0
+    for b in os.listdir("/sys/block") if os.path.isdir("/sys/block") else []:
+        if b.startswith(("sd", "nvme", "hd")) and os.path.exists("/sys/block/%s/device" % b):
+            i["hdd" if sysfs("/sys/block/%s/queue/rotational" % b) == "1" else "ssd"] += 1
+    i["meter"] = None
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        if sysfs(h + "/name") == "power_meter":  # ACPI power meter: the server's own wall reading
+            for f in ("power1_average", "power1_input"):
+                if sysfs(h + "/" + f).isdigit():
+                    i["meter"] = h + "/" + f
+                    break
+    i["batteries"] = [b for b in glob.glob("/sys/class/power_supply/*") if sysfs(b + "/type") == "Battery"]
+    mem = sysfs("/proc/meminfo").split("\n")[0].split()
+    i["ram_gb"] = int(mem[1]) / 2.0**20 if len(mem) > 1 and mem[1].isdigit() else 0.0
+
+def power(util, gpu_watts=0.0, mac=False):
+    # {"watts", "source": meter | battery | estimate, "parts"} at util % of all CPUs.
+    if mac:
+        cpu = 30.0 * max(0.0, min(1.0, util / 100.0)) ** 0.5  # Apple silicon: a few W idle, ~35 W flat out
+        return {"watts": (POWER_BASE["mac"] + cpu) / 0.9, "source": "estimate", "kind": "mac",
+                "parts": {"base": POWER_BASE["mac"], "cpu": cpu}}
+    if not power_info:
+        power_setup()
+    i = power_info
+    if i["meter"]:
+        v = sysfs(i["meter"])
+        if v.isdigit() and int(v) > 0:
+            return {"watts": int(v) / 1e6, "source": "meter"}
+    for b in i["batteries"]:
+        if sysfs(b + "/status") == "Discharging":
+            p, cur, volt = sysfs(b + "/power_now"), sysfs(b + "/current_now"), sysfs(b + "/voltage_now")
+            w = int(p) / 1e6 if p.isdigit() else int(cur) * int(volt) / 1e12 if cur.isdigit() and volt.isdigit() else 0
+            if w > 0:
+                return {"watts": w, "source": "battery"}
+    u = max(0.0, min(1.0, util / 100.0)) ** 0.5  # half the threads busy is most of the package power (turbo, HT)
+    parts = {"base": POWER_BASE[i["kind"]], "cpu": sum(t * (0.15 + 0.85 * u) for t in i["tdp"]),
+             "ram": 0.15 * i["ram_gb"], "disks": 6.0 * i["hdd"] + 2.0 * i["ssd"], "gpu": gpu_watts}
+    return {"watts": sum(parts.values()) / 0.88, "source": "estimate", "kind": i["kind"], "parts": parts}
+'''
+
 
 # ---------------------------------------------------------------------------------------------
 # Probe: runs on the target machine. Python >= 3.6, standard library only, reads /proc.
 # ---------------------------------------------------------------------------------------------
 PROBE = r'''
 import json, os, pwd, socket, subprocess, sys, time
+''' + POWER + r'''
 SAMPLE = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 1  # 0 = stream forever, one JSON line per SAMPLE seconds
 FLOWS = len(sys.argv) > 3 and sys.argv[3] == "1"  # traffic per peer: tailscale counters + TCP sockets (ss)
@@ -131,7 +206,7 @@ def filesystems():
 
 def gpus():
     try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
                             "--format=csv,noheader,nounits"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                            universal_newlines=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
@@ -141,7 +216,8 @@ def gpus():
         p = [x.strip() for x in line.split(",")]
         num = lambda s: float(s) if s.replace(".", "", 1).isdigit() else None
         out.append({"index": int(p[0]), "name": p[1], "util": num(p[2]),
-                    "mem_used": (num(p[3]) or 0) * 2**20, "mem_total": (num(p[4]) or 0) * 2**20, "temp": num(p[5])})
+                    "mem_used": (num(p[3]) or 0) * 2**20, "mem_total": (num(p[4]) or 0) * 2**20, "temp": num(p[5]),
+                    "power": num(p[6]) if len(p) > 6 else None})
     return out
 
 HWMON_KIND = {"coretemp": "cpu", "k10temp": "cpu", "k8temp": "cpu", "zenpower": "cpu", "cpu_thermal": "cpu",
@@ -498,13 +574,16 @@ def report(prev, cur):
     t0, (c0, i0), (dr0, dw0), (nr0, nt0), f0 = prev
     t1, (c1, i1), (dr1, dw1), (nr1, nt1), f1 = cur
     dt = t1 - t0
+    cpu = 100.0 * (1 - (i1 - i0) / max(c1 - c0, 1))
+    gs = gpus()
     return json.dumps({
         "hostname": socket.gethostname(), "time": t1, "ncpu": os.cpu_count(), "load": os.getloadavg(),
-        "cpu": 100.0 * (1 - (i1 - i0) / max(c1 - c0, 1)),
+        "cpu": cpu,
         "mem": meminfo(),
         "disk_io": {"read": (dr1 - dr0) / dt, "write": (dw1 - dw0) / dt},
         "net_io": {"rx": (nr1 - nr0) / dt, "tx": (nt1 - nt0) / dt},
-        "fs": filesystems(), "gpus": gpus(), "temps": temps(),
+        "fs": filesystems(), "gpus": gs, "temps": temps(),
+        "power": power(cpu, sum(g["power"] or 0 for g in gs)),
         "user": pwd.getpwuid(os.getuid()).pw_name, "sessions": sessions(), "slurm": slurm(),
         "flows": flows(f0, f1, dt),
     })
@@ -1147,6 +1226,7 @@ class Stream:
     def __init__(self, node, cfg, is_self, interval, flows=False):
         self.node, self.cfg, self.is_self, self.interval, self.flows = node, cfg, is_self, interval, flows
         self.proc, self.latest, self.received, self.seq, self.retry_at = None, None, 0.0, 0, 0.0
+        self.watts_sum, self.watts_n = 0.0, 0  # power samples since the start: the 24 h cost uses their mean
 
     def ensure(self):
         if (self.proc and self.proc.poll() is None) or time.time() < self.retry_at:
@@ -1170,6 +1250,9 @@ class Stream:
                 self.latest = json.loads(line)
             except ValueError:
                 continue
+            if (self.latest.get("power") or {}).get("watts") is not None:
+                self.watts_sum += self.latest["power"]["watts"]
+                self.watts_n += 1
             self.received, self.seq = time.time(), self.seq + 1
         err = proc.stderr.read().splitlines()
         code = proc.wait()
@@ -1185,6 +1268,8 @@ class Stream:
             r = {"error": "no data for %ds" % (time.time() - self.received)}
         else:
             r = self.latest
+        if self.watts_n and "error" not in r and "pending" not in r:
+            r = dict(r, power_avg=self.watts_sum / self.watts_n)
         return dict(r, node=self.node["name"])
 
     def stop(self):
@@ -1497,6 +1582,46 @@ def render_flows(results):
     return lines + [""]
 
 
+POWER_CFG = {"kwh_price": 6.0, "currency": "CZK", "power": {}}  # set from the config
+
+
+def energy(r):
+    """A host's power and its electricity over 24 h at that rate: the mean of the samples seen so far in a
+    live view, the current reading in a snapshot. None without a reading."""
+    p = r.get("power") or {}
+    fixed = (POWER_CFG.get("power") or {}).get(r.get("node"))
+    if fixed is not None:
+        watts = avg = float(fixed)
+        source = "config"
+    elif p.get("watts") is not None:
+        watts, avg, source = p["watts"], r.get("power_avg", p["watts"]), p["source"]
+    else:
+        return None
+    kwh = avg * 24 / 1000.0
+    return {"watts": watts, "avg": avg, "source": source, "kwh_24h": kwh,
+            "cost_24h": kwh * POWER_CFG["kwh_price"], "currency": POWER_CFG["currency"],
+            "parts": p.get("parts") if source == "estimate" else None}
+
+
+def energy_text(e):
+    """'≈172 W  4.1 kWh 25 CZK/24h'; ≈ marks an estimate (no meter, not on battery, not set in the config)."""
+    return "%s%d W  %.1f kWh %.0f %s/24h" % ("≈" if e["source"] == "estimate" else "", round(e["watts"]),
+                                             e["kwh_24h"], e["cost_24h"], e["currency"])
+
+
+def render_energy(results):
+    es = [(r["node"], energy(r)) for r in results if "error" not in r and "pending" not in r]
+    es = [(n, e) for n, e in es if e]
+    if not es:
+        return []
+    w, kwh, cost = (sum(e[k] for _, e in es) for k in ("avg", "kwh_24h", "cost_24h"))
+    measured = [n for n, e in es if e["source"] != "estimate"]
+    return ["POWER            %d host%s  %d W  %.1f kWh %.0f %s/24h at %g %s/kWh%s" % (
+        len(es), "" if len(es) == 1 else "s", round(w), kwh, cost, es[0][1]["currency"], POWER_CFG["kwh_price"],
+        es[0][1]["currency"], "  (measured: %s; the rest estimated)" % ", ".join(sorted(measured))
+        if measured and len(measured) < len(es) else "  (estimated)" if not measured else "  (measured)"), ""]
+
+
 def render(results, skipped, view="hosts"):
     """view: "hosts" (the usual table), "flows" (it plus the FLOWS section) or "flows-only"."""
     w = shutil.get_terminal_size((120, 40)).columns
@@ -1522,7 +1647,9 @@ def render(results, skipped, view="hosts"):
             continue
         m = r["mem"]
         mem_pct = 100.0 * m["used"] / m["total"]
-        lines.append("%-16s %d cores  load %.2f %.2f %.2f" % ((r["node"], r["ncpu"]) + tuple(r["load"])))
+        e = energy(r)
+        lines.append("%-16s %d cores  load %.2f %.2f %.2f%s" % ((r["node"], r["ncpu"]) + tuple(r["load"]) +
+                                                               ("   " + energy_text(e) if e else "",)))
         lines.append("  CPU  %s %s" % (bar(r["cpu"]), c("%5.1f%%" % r["cpu"], r["cpu"])))
         swap = "  swap %s/%s" % (hb(m["swap_used"]), hb(m["swap_total"])) if m["swap_total"] else ""
         lines.append("  RAM  %s %s  %s / %s%s" % (bar(mem_pct), c("%5.1f%%" % mem_pct, mem_pct),
@@ -1544,6 +1671,7 @@ def render(results, skipped, view="hosts"):
         lines += render_slurm(r, slurm_shown)
         lines.append("")
     lines += render_total(results, skipped)
+    lines += render_energy(results)
     if view == "flows":
         lines += render_flows(results)
     if skipped:
@@ -2061,7 +2189,8 @@ def serve_main(argv):
 # its process list over SSH only while the page is open.
 # ---------------------------------------------------------------------------------------------
 HTOP = r'''
-import json, os, pwd, re, socket, subprocess, sys, time
+import json, os, pwd, re, shutil, socket, subprocess, sys, time
+''' + POWER + r'''
 INTERVAL = float(sys.argv[1]) if len(sys.argv) > 1 else 2.0
 TOP = int(sys.argv[2]) if len(sys.argv) > 2 else 40  # processes sent: the busiest by CPU, plus by memory
 names = {}
@@ -2087,6 +2216,21 @@ def pick(rows):
 def run(*cmd):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
                           timeout=10, env=dict(os.environ, LC_ALL="C")).stdout
+
+gpu_cache = [0.0, 0.0]
+
+def gpu_watts():
+    # NVIDIA GPUs' own reading, asked at most every 10 s (nvidia-smi is slow to start)
+    if not shutil.which("nvidia-smi"):
+        return 0.0
+    if time.time() - gpu_cache[0] >= 10:
+        gpu_cache[0] = time.time()
+        try:
+            out = run("nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits")
+            gpu_cache[1] = sum(float(x) for x in out.split() if x.replace(".", "", 1).isdigit())
+        except (OSError, subprocess.SubprocessError):
+            gpu_cache[1] = 0.0
+    return gpu_cache[1]
 
 def linux():
     tck, page = os.sysconf("SC_CLK_TCK"), os.sysconf("SC_PAGE_SIZE")
@@ -2155,8 +2299,9 @@ def linux():
         cores_pct = [100.0 * (1 - (i1 - i0) / max(a1 - a0, 1)) for (a0, i0), (a1, i1) in zip(c0, c1)]
         with open("/proc/uptime") as f:
             uptime = float(f.read().split()[0])
-        emit({"hostname": socket.gethostname(), "time": t1, "cores": cores_pct,
-              "cpu": sum(cores_pct) / max(len(cores_pct), 1), "mem": mem, "load": os.getloadavg(),
+        cpu = sum(cores_pct) / max(len(cores_pct), 1)
+        emit({"hostname": socket.gethostname(), "time": t1, "cores": cores_pct, "power": power(cpu, gpu_watts()),
+              "cpu": cpu, "mem": mem, "load": os.getloadavg(),
               "uptime": uptime, "tasks": len(p1), "threads": sum(v["thr"] for v in p1.values()),
               "running": sum(1 for v in p1.values() if v["s"] == "R"), "procs": rows, "me": user(os.getuid())})
         c0, p0, t0 = c1, p1, t1
@@ -2193,6 +2338,7 @@ def macos():
         rows = pick(rows) if rows else rows
         cpu = min(100.0, sum(r["cpu"] for r in rows) / ncpu)
         emit({"hostname": socket.gethostname(), "time": time.time(), "cores": [], "cpu": cpu,
+              "power": power(cpu, mac=True),
               "mem": {"total": total, "used": used, "cache": cache, "swap_total": swap.get("total", 0),
                       "swap_used": swap.get("used", 0)},
               "load": os.getloadavg(), "uptime": time.time() - int(boot.group(1)) if boot else None,
@@ -2249,7 +2395,9 @@ main { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(100%, 62
 .host { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; min-width:0; }
 .host.wide { grid-column:1 / -1; }
 .top { display:flex; flex-wrap:wrap; gap:4px 14px; align-items:baseline; padding:9px 12px 6px; cursor:pointer; }
-.name { font-weight:650; font-size:15px; } .meta { color:var(--muted); font-size:12.5px; font-variant-numeric:tabular-nums; }
+.name { font-weight:650; font-size:15px; }
+.cost { margin-left:auto; font-size:12.5px; font-variant-numeric:tabular-nums; white-space:nowrap; cursor:help; }
+.cost b { font-weight:650; } .cost .est { color:var(--muted); } .meta { color:var(--muted); font-size:12.5px; font-variant-numeric:tabular-nums; }
 .meters { padding:0 12px 8px; font-family:var(--mono); font-size:11.5px; }
 .cores { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:2px 12px; margin-bottom:5px; }
 .m { display:flex; align-items:center; gap:6px; min-width:0; } .m b { font-weight:600; width:3.2em; color:var(--muted); text-align:right; flex:none; }
@@ -2309,6 +2457,17 @@ function procRow(p, me) {
     '</td><td class="state-' + esc(p.s) + '">' + esc(p.s) + '</td><td class="' + cls + '">' + p.cpu.toFixed(1) +
     "</td><td>" + p.mem.toFixed(1) + "</td><td>" + cputime(p.time) + '</td><td class="cmd" title="' + esc(p.cmd) + '">' +
     '<span class="base">' + base + '</span><span class="args">' + args + "</span></td></tr>"; }
+const SOURCES = {meter:"measured by the machine's power meter", battery:"measured: battery discharge",
+                 config:"set in the config", estimate:"estimated"};
+function costHtml(e) {
+  if (!e) return "";
+  const est = e.source === "estimate";
+  let tip = Math.round(e.watts) + " W now, " + SOURCES[e.source] + ". 24 h at the mean so far (" + Math.round(e.avg) + " W): " +
+    e.kwh_24h.toFixed(1) + " kWh × " + data.kwh_price + " " + e.currency + "/kWh.";
+  if (e.parts) tip += " Estimate: " + Object.entries(e.parts).filter(([, w]) => w > 0.05)
+    .map(([k, w]) => k + " " + Math.round(w) + " W").join(", ") + ", then ÷ 0.88 for the power supply.";
+  return '<span class="cost" title="' + esc(tip) + '"><span class="est">' + (est ? "≈" : "") + Math.round(e.watts) + " W · " +
+    e.kwh_24h.toFixed(1) + " kWh · </span><b>" + Math.round(e.cost_24h) + " " + esc(e.currency) + "</b>/24h</span>"; }
 function card(h) {
   const isWide = wide.has(h.node);
   let html = '<div class="top" data-host="' + esc(h.node) + '" title="click: full width, more rows"><span class="name">' + esc(h.node) + "</span>";
@@ -2316,7 +2475,7 @@ function card(h) {
   if (h.pending) return html + '</div><div class="pending">' + esc(h.pending) + "</div>";
   const tasks = h.tasks != null ? "Tasks " + h.tasks + ", " + h.threads + " thr; " + h.running + " running" : "";
   html += '<span class="meta">' + [tasks, "Load " + h.load.map(x => x.toFixed(2)).join(" "),
-    h.uptime != null ? "Uptime " + uptime(h.uptime) : ""].filter(Boolean).join(" · ") + "</span></div>";
+    h.uptime != null ? "Uptime " + uptime(h.uptime) : ""].filter(Boolean).join(" · ") + "</span>" + costHtml(h.energy) + "</div>";
   html += '<div class="meters">';
   if (h.cores.length > 24) {  // many cores: one small gauge each, the overall CPU as a bar
     html += meter("CPU", [[h.cpu, level(h.cpu)]], h.cpu.toFixed(1) + "% of " + h.cores.length);
@@ -2353,7 +2512,10 @@ function render() {
     el.append(d); });
   keep.forEach(d => d.remove());
   const ok = data.hosts.filter(h => !h.error && !h.pending).length;
-  $("sub").textContent = ok + "/" + data.hosts.length + " hosts · every " + data.interval + " s" + (paused ? " · paused" : "");
+  const es = data.hosts.map(h => h.energy).filter(Boolean);
+  const total = es.length ? " · " + Math.round(es.reduce((a, e) => a + e.avg, 0)) + " W, " +
+    Math.round(es.reduce((a, e) => a + e.cost_24h, 0)) + " " + data.currency + "/24h for all" : "";
+  $("sub").textContent = ok + "/" + data.hosts.length + " hosts · every " + data.interval + " s" + total + (paused ? " · paused" : "");
   $("skipped").textContent = data.skipped.length ? "not shown: " + data.skipped.join(", ") : "";
   if (!data.hosts.length) el.innerHTML = '<div class="pending">No host.</div>'; }
 async function load() {
@@ -2400,6 +2562,7 @@ def htop_main(argv):
     if a.interval < 0.5 or a.processes < 1:
         ap.error("--interval must be at least 0.5 and --processes at least 1")
     cfg = load_config()
+    POWER_CFG.update((k, cfg[k]) for k in POWER_CFG)
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
     exclude = set(x for x in a.exclude.split(",") if x) if a.exclude else set()
     streams, lock = {}, threading.Lock()
@@ -2428,7 +2591,11 @@ def htop_main(argv):
                 s.ensure()
             hosts = sorted((s.result() for s in streams.values()), key=lambda r: (not streams[r["node"]].is_self,
                                                                                    r["node"]))
-            return {"hosts": hosts, "skipped": state["skipped"], "interval": a.interval}
+            for r in hosts:
+                if "error" not in r and "pending" not in r:
+                    r["energy"] = energy(r)
+            return {"hosts": hosts, "skipped": state["skipped"], "interval": a.interval,
+                    "kwh_price": POWER_CFG["kwh_price"], "currency": POWER_CFG["currency"]}
 
     def reaper():
         # Nobody looking (tab closed, hidden or paused): stop every stream, so the hosts do no work.
@@ -3196,6 +3363,7 @@ def main():
     a = ap.parse_args(argv)
     cfg = load_config()
     TEMP_CFG.update((k, cfg[k]) for k in TEMP_CFG)
+    POWER_CFG.update((k, cfg[k]) for k in POWER_CFG)
     only = set(a.hosts.split(",")) if a.hosts else None
     if flows_only:
         a.flows = True

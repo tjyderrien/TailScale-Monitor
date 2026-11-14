@@ -28,6 +28,8 @@ server-1         64 cores  load 0.10 0.07 0.07
   an e-mail, …) when one gets too hot.
 - **Traffic between hosts.** `tailmon flows` (or `--flows` in the live view, off by default) shows who
   talks to whom and how fast, with the TCP services behind each link, from tailscale's per-peer counters and `ss`.
+- **Electricity cost.** Each host's power draw and what it costs per 24 h (CZK by default), measured
+  by the server's own power meter where there is one, estimated otherwise.
 - **htop in the browser.** `tailmon htop` opens a page with an htop of every Linux and macOS host side
   by side: cores, memory, swap and the busiest processes, live.
 - **Tailnet file tools.** `search` finds files by name and `grep` searches their contents across all
@@ -142,6 +144,32 @@ the SSH user, no root needed. NVMe drives have a sensor out of the box; SATA dis
 `drivetemp` module on that host (`sudo modprobe drivetemp`, and `echo drivetemp | sudo tee
 /etc/modules-load.d/drivetemp.conf` to keep it after a reboot). Limits can be set by hand in the config
 (`temp_high`), e.g. for a disk that the vendor rates lower.
+
+### Electricity cost
+
+Each host's header line (and its card in `tailmon htop`) shows its power and what 24 hours at that rate cost,
+with a `POWER` total for all hosts:
+
+```
+biatri-2         128 cores  load 15.09 20.08 26.54   473 W  11.4 kWh 68 CZK/24h
+bumblefoot       48 cores  load 8.79 8.30 8.25   ≈204 W  4.9 kWh 29 CZK/24h
+POWER            5 hosts  954 W  22.9 kWh 137 CZK/24h at 6 CZK/kWh  (measured: biatri-1, biatri-2; the rest estimated)
+```
+
+The power comes, in this order, from the server's own power meter (ACPI `power_meter`, e.g. Intel Node
+Manager or HPE iLO, which measures the whole box at the wall), from the battery of a laptop running on it,
+or from an estimate, marked `≈`: a base for the chassis (laptop 4 W, desktop 25 W, server 60 W), each CPU
+package's rated power (RAPL's PL1, readable without root) at 15 % when idle up to 100 % as the load grows,
+0.15 W per GB of RAM, 6 W per hard disk and 2 W per SSD, the NVIDIA GPUs' own reading, then ÷ 0.88 for the
+power supply. Expect ±30 % for an estimate; on the htop page, hover the cost to see its parts. Macs get
+4 W plus up to 30 W with load.
+
+The 24 h figure uses the mean of the readings seen since tailmon started (in a live view), or the current
+reading (in a snapshot). Set your price and the hosts you measured yourself in the config:
+
+```json
+{"kwh_price": 6.5, "currency": "CZK", "power": {"luzicka": 85}}
+```
 
 ### Traffic between hosts
 
@@ -396,6 +424,9 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `temp_warn_margin` | A sensor turns yellow this many °C below its limit (default `10`)                        |
 | `gate_key`         | tailmon's own SSH key for gated hosts (default `~/.ssh/tailmon_gate`, created by `tailmon gate install`) |
 | `gate_hosts`       | Hosts reached through their gate, kept up to date by `tailmon gate install` / `remove` (default `[]`) |
+| `kwh_price`        | Price of a kWh, all in (energy, distribution, taxes), for the cost per 24 h (default `6.0`) |
+| `currency`         | Its currency (default `"CZK"`)                                                           |
+| `power`            | Power in W of hosts you measured yourself (plug meter), replacing tailmon's reading (default `{}`) |
 | `flows`            | Show the FLOWS section in the monitor without `--flows` (default `false`)                |
 
 tailmon runs `ssh <short-name>` with the Tailscale address pinned as `HostName`, so `Host <short-name>` entries in
@@ -417,6 +448,7 @@ Nothing is required: with no config file, tailmon connects to each host the way 
 | (Mac)  | when tailmon itself runs on macOS, the local machine is probed too: CPU from `host_statistics`, RAM from `vm_stat` (used = app memory + wired + compressed, as in Activity Monitor), IO from `ioreg` and `netstat -ibn`, HDD from `mount` (an APFS container counted once) |
 | TOTAL  | storage summed over all hosts, shown only when at most one Linux host is offline or unreachable (then marked incomplete). Excluded and non-Linux peers don't count |
 | USERS  | `who`: interactive logins; people other than the SSH user are highlighted                        |
+| POWER  | the server's power meter (`/sys/class/hwmon/*/power1_average`), a discharging battery, or an estimate from RAPL's PL1, load, RAM, disks and `nvidia-smi` |
 | FLOWS  | with `--flows`: tailscaled's per-peer byte counters and `ss -ti` TCP sockets, merged from both ends of each link |
 | SLURM  | `sinfo` / `squeue`, when installed (refreshed at most every 10 s): node state and CPU allocation, then the job queue. Hosts reporting the same cluster show it once |
 
