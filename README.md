@@ -26,6 +26,8 @@ server-1         64 cores  load 0.10 0.07 0.07
 - **Temperatures.** CPU, GPU, NVMe / SATA disk and board sensors, each checked against its own limit.
   Overheating hosts are listed at the top in red, and `--alert CMD` runs a command (a desktop notification,
   an e-mail, …) when one gets too hot.
+- **Traffic between hosts.** `tailmon flows` (or `--flows` in the live view, off by default) shows who
+  talks to whom and how fast, with the TCP services behind each link, from tailscale's per-peer counters and `ss`.
 - **Tailnet file tools.** `search` finds files by name and `grep` searches their contents across all
   online Linux and macOS peers, without installing anything on them.
 - **Hosts approve what runs.** `tailmon gate install` gives tailmon its own SSH key, which each host only
@@ -46,7 +48,7 @@ On the machine running tailmon:
 On each monitored host:
 
 - Linux with `python3` ≥ 3.6 on the `PATH` (the probe reads `/proc` and `/sys`)
-- optionally `nvidia-smi` for GPU stats
+- optionally `nvidia-smi` for GPU stats, and `ss` (iproute2) for `flows`
 - for `mount`: SFTP enabled in `sshd` (the OpenSSH default)
 
 Non-Linux and offline peers are listed as "not probed". macOS hosts aren't monitored (no `/proc`), but
@@ -138,6 +140,41 @@ the SSH user, no root needed. NVMe drives have a sensor out of the box; SATA dis
 `drivetemp` module on that host (`sudo modprobe drivetemp`, and `echo drivetemp | sudo tee
 /etc/modules-load.d/drivetemp.conf` to keep it after a reboot). Limits can be set by hand in the config
 (`temp_high`), e.g. for a disk that the vendor rates lower.
+
+### Traffic between hosts
+
+```sh
+tailmon flows                        # snapshot: who exchanged how much with whom over 1 s
+tailmon flows -w 2                   # live
+tailmon -w 1 --flows                 # the usual live view, with a FLOWS section at the bottom
+tailmon flows --json                 # the merged links
+```
+
+```
+FLOWS            5 links between hosts, 1 quieter hidden
+  biatri-2         ⇄ mac-mini         █·········  → 5.8K/s    ← 408B/s    ssh@biatri-2 4.8K/s
+  bumblefoot       ⇄ mac-mini         █·········  → 3.6K/s    ← 936B/s    ssh@bumblefoot 2.6K/s
+  biatri-1         ⇄ bumblefoot       ··········  → 1.2K/s    ← 52B/s     ssh@biatri-1 1.1K/s
+```
+
+One line per pair of hosts, busiest first: the rate each way (`→` from the left host to the right one) and
+the TCP services behind it, as `service@server` (the host that listens). The bar is logarithmic, from
+1 KB/s to 1 GB/s. It is off unless asked for (`--flows`, `tailmon flows`, or `"flows": true` in the config,
+which `--no-flows` overrides): each probe then also, at every sample,
+
+- reads tailscaled's byte counters per peer (all traffic over the tailnet, any protocol, WireGuard overhead
+  included) from its LocalAPI socket, falling back to `tailscale status --json`, and
+- lists the established TCP sockets with `ss -ti`, with their byte counts (kernel ≥ 4.2), which names the
+  services and also covers traffic between hosts over LAN addresses.
+
+Both ends of a link report it; tailmon keeps the larger reading each way, so peers that are not probed
+(macOS, phones) still show up through the Linux hosts they talk to. No root needed. Not seen: UDP outside
+the tailnet, and TCP connections that open and close between two samples. tailmon's own SSH sessions are
+visible too (about 20 KB per host for a snapshot, ~1 KB/s for a live stream).
+
+Cost on the probed host, measured at one sample per second with ~180 TCP sockets: about 20 ms of CPU per
+sample (2 % of a core), mostly `ss`; it grows with the number of sockets. On a gated host, approve the new
+probe once (`tailmon gate approve`).
 
 ### Sound volume
 
@@ -331,6 +368,7 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `temp_warn_margin` | A sensor turns yellow this many °C below its limit (default `10`)                        |
 | `gate_key`         | tailmon's own SSH key for gated hosts (default `~/.ssh/tailmon_gate`, created by `tailmon gate install`) |
 | `gate_hosts`       | Hosts reached through their gate, kept up to date by `tailmon gate install` / `remove` (default `[]`) |
+| `flows`            | Show the FLOWS section in the monitor without `--flows` (default `false`)                |
 
 tailmon runs `ssh <short-name>` with the Tailscale address pinned as `HostName`, so `Host <short-name>` entries in
 `~/.ssh/config` (`User`, `IdentityFile`, …) apply as they would for a plain `ssh <short-name>`.
@@ -351,6 +389,7 @@ Nothing is required: with no config file, tailmon connects to each host the way 
 | (Mac)  | when tailmon itself runs on macOS, the local machine is probed too: CPU from `host_statistics`, RAM from `vm_stat` (used = app memory + wired + compressed, as in Activity Monitor), IO from `ioreg` and `netstat -ibn`, HDD from `mount` (an APFS container counted once) |
 | TOTAL  | storage summed over all hosts, shown only when at most one Linux host is offline or unreachable (then marked incomplete). Excluded and non-Linux peers don't count |
 | USERS  | `who`: interactive logins; people other than the SSH user are highlighted                        |
+| FLOWS  | with `--flows`: tailscaled's per-peer byte counters and `ss -ti` TCP sockets, merged from both ends of each link |
 | SLURM  | `sinfo` / `squeue`, when installed (refreshed at most every 10 s): node state and CPU allocation, then the job queue. Hosts reporting the same cluster show it once |
 
 ## License

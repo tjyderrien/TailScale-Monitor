@@ -15,6 +15,7 @@ the local machine is probed directly.
     tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
     tailmon.py gate install       let each host approve the scripts tailmon runs on it (own key + gate)
     tailmon.py tasks              the last 3 Todoist tasks each host ran (claude-explorer dispatch), read-only
+    tailmon.py flows -w 2         live traffic between the hosts (also: tailmon.py -w 1 --flows)
 """
 import argparse
 import base64
@@ -22,10 +23,12 @@ import concurrent.futures as cf
 import hashlib
 import json
 import locale
+import math
 import shlex
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -52,6 +55,9 @@ DEFAULT_CONFIG = {
     # those hosts (kept up to date by `tailmon gate install` / `remove`).
     "gate_key": "~/.ssh/tailmon_gate",
     "gate_hosts": [],
+    # Traffic between the hosts (FLOWS section) in the monitor, as with --flows. Off by default: each probe
+    # then also runs `ss` and `tailscale status` every sample.
+    "flows": False,
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -61,6 +67,7 @@ PROBE = r'''
 import json, os, pwd, socket, subprocess, sys, time
 SAMPLE = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 1  # 0 = stream forever, one JSON line per SAMPLE seconds
+FLOWS = len(sys.argv) > 3 and sys.argv[3] == "1"  # traffic per peer: tailscale counters + TCP sockets (ss)
 LOCAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "vfat", "exfat", "ntfs", "fuseblk"}
 
 def cpu_times():
@@ -349,12 +356,146 @@ if sys.platform == "darwin":  # macOS has no /proc: the same numbers from mach, 
                         "inodes_total": s.f_files, "inodes_used": s.f_files - s.f_ffree})
         return out
 
+def split_addr(s):
+    """'10.0.0.1:22', '[fd7a::1]:22', '[::ffff:10.0.0.1]:22', '100.1.2.3%tailscale0:22' -> (ip, port)."""
+    host, _, port = s.rpartition(":")
+    host = host.strip("[]").split("%")[0]
+    return (host[7:] if host.startswith("::ffff:") else host), (int(port) if port.isdigit() else 0)
+
+def tailscaled_status():
+    """tailscaled's status, straight from its LocalAPI socket (what `tailscale status` asks, without
+    starting the CLI each sample: ~1 ms instead of ~40 ms of CPU); the CLI if the socket is elsewhere."""
+    for path in ("/var/run/tailscale/tailscaled.sock", "/run/tailscale/tailscaled.sock"):
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.settimeout(5)
+            s.connect(path)
+            s.sendall(b"GET /localapi/v0/status HTTP/1.0\r\nHost: local-tailscaled.sock\r\n"
+                      b"Sec-Tailscale: localapi\r\n\r\n")
+            chunks = []
+            while True:
+                b = s.recv(1 << 16)
+                if not b:
+                    break
+                chunks.append(b)
+            head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+            if head.split(b" ", 2)[1:2] == [b"200"]:
+                return json.loads(body.decode("utf-8"))
+        except (OSError, ValueError, IndexError):
+            pass
+        finally:
+            s.close()
+    try:
+        return json.loads(run(["tailscale", "status", "--json"]) or "")
+    except ValueError:
+        return None
+
+def tailnet_bytes():
+    """{peer name: (rx, tx)} bytes exchanged with each tailnet peer since tailscaled met it (all protocols)."""
+    st = tailscaled_status()
+    if not isinstance(st, dict):
+        return None
+    out = {}
+    for p in (st.get("Peer") or {}).values():
+        name = (p.get("DNSName") or "").split(".")[0] or p.get("HostName") or "?"
+        out[name] = (p.get("RxBytes") or 0, p.get("TxBytes") or 0)
+    return out
+
+def tcp_bytes():
+    """{(local, peer): (bytes acked, bytes received)} of every established TCP socket, from the kernel's
+    sock_diag through `ss` (no root needed). None without ss."""
+    text = run(["ss", "-tinH", "state", "established"])
+    if text is None:
+        return None
+    socks, key = {}, None
+    for line in text.splitlines():
+        if not line[:1].isspace():  # the socket; its tcp_info follows on an indented line
+            addrs = [w for w in line.split() if ":" in w]
+            key = (addrs[0], addrs[1]) if len(addrs) >= 2 else None
+        acked = received = None
+        for w in line.split():
+            if w.startswith("bytes_acked:"):
+                acked = int(w[12:])
+            elif w.startswith("bytes_received:"):
+                received = int(w[15:])
+        if key and (acked is not None or received is not None):
+            socks[key] = (acked or 0, received or 0)
+    return socks
+
+listen_cache = [0.0, set()]
+
+def listening_ports():
+    if time.time() - listen_cache[0] >= 10:
+        listen_cache[0], ports = time.time(), set()
+        for line in (run(["ss", "-tlnH"]) or "").splitlines():
+            addrs = [w for w in line.split() if ":" in w]
+            if addrs:
+                ports.add(split_addr(addrs[0])[1])
+        listen_cache[1] = ports
+    return listen_cache[1]
+
+def local_addrs():
+    """This host's IPv4 / IPv6 addresses, so the collector can tell which host a LAN address is."""
+    out, last = set(), None
+    try:
+        with open("/proc/net/fib_trie") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("|-- "):
+                    last = s[4:]
+                elif s == "/32 host LOCAL" and last:
+                    out.add(last)
+    except OSError:
+        pass
+    try:
+        with open("/proc/net/if_inet6") as f:
+            for line in f:
+                h = line.split()[0]
+                out.add(socket.inet_ntop(socket.AF_INET6, bytes.fromhex(h)))
+    except (OSError, ValueError):
+        pass
+    return sorted(a for a in out if not a.startswith(("127.", "fe80:")) and a != "::1")
+
+def flow_counters():
+    return {"tailnet": tailnet_bytes(), "tcp": tcp_bytes()} if FLOWS else None
+
+def flows(prev, cur, dt):
+    """Bytes/s to and from each peer over the last interval. TCP is grouped by peer address and service port
+    (the listening side's port); a socket that opened and closed between two samples isn't seen."""
+    if cur is None:
+        return None
+    out = {"addrs": local_addrs(), "tailnet": None, "tcp": None}
+    if cur["tailnet"] is not None:
+        old, out["tailnet"] = prev["tailnet"] or {}, {}
+        for name, (rx, tx) in cur["tailnet"].items():
+            rx0, tx0 = old.get(name, (rx, tx))  # a new peer: its counters start at the next sample
+            d_rx, d_tx = (rx - rx0 if rx >= rx0 else rx), (tx - tx0 if tx >= tx0 else tx)  # restart: from 0
+            if d_rx or d_tx:
+                out["tailnet"][name] = {"rx": d_rx / dt, "tx": d_tx / dt}
+    if cur["tcp"] is not None:
+        old, listen, agg = prev["tcp"] or {}, listening_ports(), {}
+        for key, (acked, received) in cur["tcp"].items():
+            a0, r0 = old.get(key, (0, 0))  # a socket opened during the interval: all its bytes are new
+            tx, rx = max(0, acked - a0), max(0, received - r0)
+            if not (tx or rx):
+                continue
+            (lip, lport), (pip, pport) = split_addr(key[0]), split_addr(key[1])
+            if pip.startswith("127.") or pip == "::1":
+                continue
+            side = "in" if lport in listen else "out"  # in: the peer connected to our service
+            e = agg.setdefault((pip, lport if side == "in" else pport, side), [0, 0])
+            e[0] += rx
+            e[1] += tx
+        rows = [{"ip": k[0], "port": k[1], "side": k[2], "rx": v[0] / dt, "tx": v[1] / dt} for k, v in agg.items()]
+        out["tcp"] = sorted(rows, key=lambda r: -(r["rx"] + r["tx"]))[:64]
+    return out
+
 def counters():
-    return time.time(), cpu_times(), disks_io(), net_io()
+    return time.time(), cpu_times(), disks_io(), net_io(), flow_counters()
 
 def report(prev, cur):
-    t0, (c0, i0), (dr0, dw0), (nr0, nt0) = prev
-    t1, (c1, i1), (dr1, dw1), (nr1, nt1) = cur
+    t0, (c0, i0), (dr0, dw0), (nr0, nt0), f0 = prev
+    t1, (c1, i1), (dr1, dw1), (nr1, nt1), f1 = cur
     dt = t1 - t0
     return json.dumps({
         "hostname": socket.gethostname(), "time": t1, "ncpu": os.cpu_count(), "load": os.getloadavg(),
@@ -364,6 +505,7 @@ def report(prev, cur):
         "net_io": {"rx": (nr1 - nr0) / dt, "tx": (nt1 - nt0) / dt},
         "fs": filesystems(), "gpus": gpus(), "temps": temps(),
         "user": pwd.getpwuid(os.getuid()).pw_name, "sessions": sessions(), "slurm": slurm(),
+        "flows": flows(f0, f1, dt),
     })
 
 prev, n = counters(), 0
@@ -567,8 +709,14 @@ def discover():
 
     def node(p):
         return {"name": p["DNSName"].split(".")[0] or p["HostName"], "dns": p["DNSName"].rstrip("."),
-                "ip": (p.get("TailscaleIPs") or [None])[0], "os": p.get("OS", ""), "online": p.get("Online", False)}
-    return node(st["Self"]), [node(p) for p in (st.get("Peer") or {}).values()]
+                "ip": (p.get("TailscaleIPs") or [None])[0], "ips": p.get("TailscaleIPs") or [],
+                "os": p.get("OS", ""), "online": p.get("Online", False)}
+    me, peers = node(st["Self"]), [node(p) for p in (st.get("Peer") or {}).values()]
+    TAILNET[:] = [me] + peers  # every node, also those not probed: names for the flow view
+    return me, peers
+
+
+TAILNET = []  # the nodes of the last discover()
 
 
 PROBE_SELF_OSES = ("linux", "macOS")  # the probe also reads a Mac, but only this one: remote Macs are not probed
@@ -615,14 +763,15 @@ def ssh_error(stderr_lines, code, width=120):
     return err[:width]
 
 
-def probe_cmd(node, cfg, is_self, sample, count):
+def probe_cmd(node, cfg, is_self, sample, count, flows=False):
+    args = [sample, count, 1 if flows else 0]
     if is_self:
-        return [sys.executable, "-", str(sample), str(count)]
-    return python_cmd(node, cfg, [sample, count], keepalive=True)
+        return [sys.executable, "-"] + [str(x) for x in args]
+    return python_cmd(node, cfg, args, keepalive=True)
 
 
-def probe(node, cfg, is_self):
-    args = probe_cmd(node, cfg, is_self, cfg["sample_seconds"], 1)
+def probe(node, cfg, is_self, flows=False):
+    args = probe_cmd(node, cfg, is_self, cfg["sample_seconds"], 1, flows)
     try:
         r = subprocess.run(args, input=PROBE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=30 + cfg["sample_seconds"])
@@ -659,10 +808,10 @@ def targets_for(cfg, only=None, exclude=(), oses=("linux",), self_oses=None):
     return targets, skipped
 
 
-def collect(cfg, only=None):
+def collect(cfg, only=None, flows=False):
     targets, skipped = targets_for(cfg, only, self_oses=PROBE_SELF_OSES)
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
-        futs = [(n, ex.submit(probe, n, cfg, s)) for n, s in targets]
+        futs = [(n, ex.submit(probe, n, cfg, s, flows)) for n, s in targets]
         results = [dict(f.result(), node=n["name"]) for n, f in futs]
     return results, skipped
 
@@ -993,15 +1142,15 @@ class Stream:
     """One long-lived probe per host that prints a sample every `interval` seconds; reconnects if it dies."""
     RETRY = 10.0
 
-    def __init__(self, node, cfg, is_self, interval):
-        self.node, self.cfg, self.is_self, self.interval = node, cfg, is_self, interval
+    def __init__(self, node, cfg, is_self, interval, flows=False):
+        self.node, self.cfg, self.is_self, self.interval, self.flows = node, cfg, is_self, interval, flows
         self.proc, self.latest, self.received, self.seq, self.retry_at = None, None, 0.0, 0, 0.0
 
     def ensure(self):
         if (self.proc and self.proc.poll() is None) or time.time() < self.retry_at:
             return
         self.retry_at = time.time() + self.RETRY
-        self.proc = subprocess.Popen(probe_cmd(self.node, self.cfg, self.is_self, self.interval, 0),
+        self.proc = subprocess.Popen(probe_cmd(self.node, self.cfg, self.is_self, self.interval, 0, self.flows),
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      universal_newlines=True, bufsize=1)
         self.proc.stdin.write(PROBE)
@@ -1226,9 +1375,131 @@ def render_slurm(r, shown):
     return lines
 
 
-def render(results, skipped):
+FLOW_MIN = 512.0  # B/s: links slower than this are counted but not drawn
+FLOW_MAX_LINKS = 25
+SERVICE_NAMES = {}
+
+
+def service(port):
+    if port not in SERVICE_NAMES:
+        try:
+            SERVICE_NAMES[port] = socket.getservbyport(port, "tcp")
+        except (OSError, OverflowError):
+            SERVICE_NAMES[port] = str(port)
+    return SERVICE_NAMES[port]
+
+
+def address_book(results):
+    """{ip: host} from the Tailscale addresses of every node and the addresses each probed host reports
+    (LAN, ...). An address several hosts claim (docker0's 172.17.0.1, say) names nobody."""
+    book, clash = {}, set()
+    for n in TAILNET:
+        for ip in n.get("ips") or []:
+            book[ip] = n["name"]
+    for r in results:
+        for ip in (r.get("flows") or {}).get("addrs") or []:
+            if book.get(ip, r["node"]) != r["node"]:
+                clash.add(ip)
+            book.setdefault(ip, r["node"])
+    for ip in clash:
+        book.pop(ip, None)
+    return book
+
+
+def flow_links(results):
+    """Traffic between hosts, merged from both ends: [{from, to, rate, tailscale, tcp: {service@server: B/s}}].
+    Each end sees the same bytes, so a direction gets the larger of the two reports (the other end may be
+    unprobed: macOS, a phone). Its rate is the larger of the tailscale counter (everything over the tailnet,
+    WireGuard overhead included) and the sum of its TCP sockets (which also covers direct LAN traffic)."""
+    book, links = address_book(results), {}
+
+    def link(src, dst):
+        return links.setdefault((src, dst), {"from": src, "to": dst, "tailscale": 0.0, "tcp": {}})
+
+    for r in results:
+        f = r.get("flows")
+        if not f:
+            continue
+        me = r["node"]
+        for peer, v in (f.get("tailnet") or {}).items():
+            if peer != me:
+                for src, dst, rate in ((me, peer, v["tx"]), (peer, me, v["rx"])):
+                    l = link(src, dst)
+                    l["tailscale"] = max(l["tailscale"], rate)
+        for t in f.get("tcp") or []:
+            peer = book.get(t["ip"])
+            if not peer or peer == me:
+                continue  # the internet, or this host's own address
+            label = "%s@%s" % (service(t["port"]), me if t["side"] == "in" else peer)
+            for src, dst, rate in ((me, peer, t["tx"]), (peer, me, t["rx"])):
+                if rate > 0:
+                    tcp = link(src, dst)["tcp"]
+                    tcp[label] = max(tcp.get(label, 0.0), rate)
+    out = []
+    for l in links.values():
+        l["rate"] = max(l["tailscale"], sum(l["tcp"].values()))
+        if l["rate"] > 0:
+            out.append(l)
+    return sorted(out, key=lambda l: -l["rate"])
+
+
+def rate_bar(rate, width=10):
+    """Log scale, 1 KB/s (empty) to 1 GB/s (full), colored as the other bars at ~16 MB/s and ~250 MB/s."""
+    pct = max(0.0, min(100.0, 100.0 * math.log10(max(rate, 1.0) / 1e3) / 6)) if rate > 0 else 0.0
+    return bar(pct, width)
+
+
+def render_flows(results):
+    """FLOWS: one line per pair of hosts, both directions, busiest first, with the TCP services behind it."""
+    links = flow_links(results)
+    pairs = {}
+    for l in links:
+        pairs.setdefault(tuple(sorted((l["from"], l["to"]))), []).append(l)
+    rows = []
+    for key, ls in pairs.items():
+        ls.sort(key=lambda l: -l["rate"])
+        fwd = ls[0]  # the busier direction goes left to right
+        back = ls[1] if len(ls) > 1 else {"rate": 0.0, "tcp": {}}
+        rows.append((fwd["rate"] + back["rate"], fwd, back))
+    rows.sort(key=lambda x: -x[0])
+    shown = [x for x in rows if x[0] >= FLOW_MIN][:FLOW_MAX_LINKS]
+    probed = [r for r in results if r.get("flows")]
+    blind = sorted(r["node"] for r in probed
+                   if r["flows"].get("tailnet") is None and r["flows"].get("tcp") is None)
+    head = "FLOWS            %d link%s between hosts" % (len(shown), "" if len(shown) == 1 else "s")
+    if len(rows) > len(shown):
+        head += ", %d quieter hidden" % (len(rows) - len(shown))
+    lines = [head + ("  (no tailscale or ss on: %s)" % ", ".join(blind) if blind else "")]
+    for total, fwd, back in shown:
+        services = {}
+        for l in (fwd, back):
+            for label, rate in l["tcp"].items():
+                services[label] = services.get(label, 0.0) + rate
+        top = sorted(services.items(), key=lambda x: -x[1])
+        detail = "  ".join("%s %s" % (label, hb(rate, True)) for label, rate in top[:4] if rate >= FLOW_MIN / 4)
+        lines.append("  %-16s ⇄ %-16s %s  → %-9s ← %-9s %s" % (
+            fwd["from"][:16], fwd["to"][:16], rate_bar(total), hb(fwd["rate"], True), hb(back["rate"], True),
+            detail))
+    if not probed:
+        lines.append("  no flow data yet")
+    elif not shown:
+        lines.append("  quiet: nothing above %s between hosts" % hb(FLOW_MIN, True))
+    return lines + [""]
+
+
+def render(results, skipped, view="hosts"):
+    """view: "hosts" (the usual table), "flows" (it plus the FLOWS section) or "flows-only"."""
     w = shutil.get_terminal_size((120, 40)).columns
-    lines = [time.strftime("tailmon  %Y-%m-%d %H:%M:%S"), ""] + render_alarms(results)
+    lines = [time.strftime("tailmon  %Y-%m-%d %H:%M:%S"), ""]
+    if view == "flows-only":
+        lines += render_flows(results)
+        down = sorted((r["node"], r["error"]) for r in results if "error" in r)
+        lines += ["%-16s %s" % (n, c("UNREACHABLE: " + e, 100)) for n, e in down]
+        if skipped:
+            lines.append("not probed (their traffic with probed hosts is shown): " + ", ".join(
+                "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped))
+        return "\n".join(l if len(l) < w + 20 else l[:w + 20] for l in lines)
+    lines += render_alarms(results)
     slurm_shown = {}
     for r in sorted(results, key=lambda r: r["node"]):
         if "pending" in r:
@@ -1263,21 +1534,23 @@ def render(results, skipped):
         lines += render_slurm(r, slurm_shown)
         lines.append("")
     lines += render_total(results, skipped)
+    if view == "flows":
+        lines += render_flows(results)
     if skipped:
         lines.append("not probed: " + ", ".join(
             "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped))
     return "\n".join(l if len(l) < w + 20 else l[:w + 20] for l in lines)
 
 
-def draw(results, skipped, live):
-    out = render(results, skipped)
+def draw(results, skipped, live, view="hosts"):
+    out = render(results, skipped, view)
     if live and COLOR:
         # home the cursor and overwrite in place (clear to end of each line / screen) to avoid flicker
         out = "\033[H" + out.replace("\n", "\033[K\n") + "\033[K\033[J"
     print(out, flush=True)
 
 
-def rediscover(streams, logged, cfg, only, interval):
+def rediscover(streams, logged, cfg, only, interval, flows=False):
     """Start streams for newly seen hosts and stop those that went away; return the skipped list."""
     targets, skipped = targets_for(cfg, only, self_oses=PROBE_SELF_OSES)
     names = {n["name"] for n, _ in targets}
@@ -1286,13 +1559,13 @@ def rediscover(streams, logged, cfg, only, interval):
         logged.pop(name, None)
     for n, is_self in targets:
         if n["name"] not in streams:
-            streams[n["name"]] = Stream(n, cfg, is_self, interval)
+            streams[n["name"]] = Stream(n, cfg, is_self, interval, flows)
     return skipped
 
 
 def watch(cfg, only, a):
     streams, logged, alerted = {}, {}, set()
-    skipped = rediscover(streams, logged, cfg, only, a.watch)
+    skipped = rediscover(streams, logged, cfg, only, a.watch, a.flows)
     next_discover = time.time() + cfg["discover_seconds"]
     if not a.quiet and COLOR:
         print("\033[2J", end="")
@@ -1302,7 +1575,7 @@ def watch(cfg, only, a):
             if time.time() >= next_discover:
                 next_discover = time.time() + cfg["discover_seconds"]
                 try:
-                    skipped = rediscover(streams, logged, cfg, only, a.watch)
+                    skipped = rediscover(streams, logged, cfg, only, a.watch, a.flows)
                 except (OSError, ValueError, subprocess.CalledProcessError):
                     pass  # tailscale hiccup: keep the current host list and try again later
             for s in streams.values():
@@ -1320,7 +1593,7 @@ def watch(cfg, only, a):
                             logged[s.node["name"]] = s.seq
                             f.write(json.dumps(r) + "\n")
             if not a.quiet:
-                draw(results, skipped, True)
+                draw(results, skipped, True, a.view)
             deadline += a.watch
             time.sleep(max(0.0, deadline - time.time()))
     finally:
@@ -2441,7 +2714,19 @@ def main():
         return gate_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "tasks":
         return tasks_main(sys.argv[1:])
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    flows_only = sys.argv[1:2] == ["flows"]
+    argv = sys.argv[2:] if flows_only else sys.argv[1:]
+    if flows_only:
+        ap = argparse.ArgumentParser(prog="tailmon flows",
+                                     description="Traffic between the Tailscale hosts: tailscale's byte counters "
+                                                 "per peer and TCP sockets (ss), read on every Linux host")
+    else:
+        ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        ap.add_argument("--flows", action="store_true", default=None,
+                        help="also show the traffic between hosts (each probe then runs ss and tailscale status "
+                             "every sample; `tailmon flows` shows only that)")
+        ap.add_argument("--no-flows", dest="flows", action="store_false",
+                        help="don't, even if the config has \"flows\": true")
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")
     ap.add_argument("--log", metavar="FILE", help="append each sample as JSON lines to FILE")
@@ -2450,14 +2735,23 @@ def main():
     ap.add_argument("--alert", metavar="CMD",
                     help="shell command run when a temperature reaches its limit (TAILMON_HOST, TAILMON_SENSOR, "
                          "TAILMON_TEMP, TAILMON_LIMIT, ... in its environment); a snapshot also exits with status 3")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     cfg = load_config()
     TEMP_CFG.update((k, cfg[k]) for k in TEMP_CFG)
     only = set(a.hosts.split(",")) if a.hosts else None
+    if flows_only:
+        a.flows = True
+    elif a.flows is None:
+        a.flows = bool(cfg.get("flows"))
+    a.view = "flows-only" if flows_only else "flows" if a.flows else "hosts"
 
     if a.watch and not a.json:
         return watch(cfg, only, a)
-    results, skipped = collect(cfg, only)
+    results, skipped = collect(cfg, only, a.flows)
+    if flows_only and a.json:
+        print(json.dumps({"links": flow_links(results), "hosts": sorted(r["node"] for r in results if r.get("flows")),
+                          "errors": {r["node"]: r["error"] for r in results if "error" in r}}, indent=2))
+        return
     if a.log:
         with open(os.path.expanduser(a.log), "a") as f:
             for r in results:
@@ -2465,7 +2759,9 @@ def main():
     if a.json:
         print(json.dumps(results, indent=2))
     elif not a.quiet:
-        draw(results, skipped, False)
+        draw(results, skipped, False, a.view)
+    if flows_only:
+        return  # temperatures belong to the monitor: no HOT messages or exit status 3 here
     hot = [(host, sn) for host, sn in alarms(results) if sn["level"] == "hot"]
     for host, sn in hot:
         if a.alert:
