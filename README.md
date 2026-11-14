@@ -28,6 +28,8 @@ server-1         64 cores  load 0.10 0.07 0.07
   an e-mail, …) when one gets too hot.
 - **Traffic between hosts.** `tailmon flows` (or `--flows` in the live view, off by default) shows who
   talks to whom and how fast, with the TCP services behind each link, from tailscale's per-peer counters and `ss`.
+- **htop in the browser.** `tailmon htop` opens a page with an htop of every Linux and macOS host side
+  by side: cores, memory, swap and the busiest processes, live.
 - **Tailnet file tools.** `search` finds files by name and `grep` searches their contents across all
   online Linux and macOS peers, without installing anything on them.
 - **Hosts approve what runs.** `tailmon gate install` gives tailmon its own SSH key, which each host only
@@ -208,6 +210,32 @@ macOS, Windows and Android hosts are included too (monitoring stays Linux-only):
 It listens on every interface by default with no password: anyone who can reach the port can change the
 volume. Use `--token`, or `--bind` with this PC's Tailscale IP so only the tailnet can reach it.
 
+### htop of every host, in the browser
+
+```sh
+tailmon htop                         # opens http://localhost:8766/; other machines: http://<this-pc>:8766/
+tailmon htop -w 1 --hosts biatri-1,biatri-2
+tailmon htop --bind 127.0.0.1        # this PC only
+```
+
+One card per host (this one first): per-core CPU bars (a grid of small gauges past 24 cores), memory (used in
+green, cache in yellow) and swap, tasks, load and uptime, then the processes with htop's columns (PID, USER,
+PRI, NI, VIRT, RES, S, CPU%, MEM%, TIME+, Command). Click a column to sort every host by it, a host's name
+to show it full width with all its processes, type in the filter to keep matching commands, users or PIDs.
+CPU% is per core, as in htop: 400 % is four cores busy. Other users' processes are in blue. Linux hosts are
+read from `/proc`; macOS ones with `ps`, `vm_stat` and `sysctl` (no per-core bars there).
+
+Each host sends its 40 busiest processes by CPU and its 40 biggest by memory (`-n`) every 2 seconds (`-w`),
+over one SSH stream, only while the page is open: after 20 seconds with no page asking (tab closed, hidden
+or paused), the streams stop and the hosts do nothing; they come back when you look again. Reading `/proc`
+costs about 80 ms of CPU per refresh on a host with 700 processes (4 % of a core at the 2 s default).
+
+It listens on `127.0.0.1` and on this PC's Tailscale address, so any machine of your tailnet can open
+`http://<this-pc>:8766/` (MagicDNS name) while the LAN and the internet can't reach it: command lines can hold
+sensitive arguments. `--bind ADDR` listens on that address only (`127.0.0.1`: this PC only; `0.0.0.0`:
+everywhere, better with `--token`). On a gated host, approve the new
+script once (`tailmon gate approve`).
+
 ### Files across the tailnet
 
 ```sh
@@ -312,8 +340,8 @@ tailmon gate remove --hosts asus     # back to your normal login on that host
 ```
 
 `install` logs in once with your normal key. It creates the gate key `~/.ssh/tailmon_gate` here if
-needed, copies the gate to `~/.local/share/tailmon/gate.py` on each host, approves this tailmon's three
-scripts (monitoring probe, file tool, volume) and adds one line to `authorized_keys`, after a backup
+needed, copies the gate to `~/.local/share/tailmon/gate.py` on each host, approves this tailmon's four
+scripts (monitoring probe, file tool, volume, htop) and adds one line to `authorized_keys`, after a backup
 (`authorized_keys.before-tailmon`):
 
 ```

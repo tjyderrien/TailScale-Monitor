@@ -16,6 +16,7 @@ the local machine is probed directly.
     tailmon.py gate install       let each host approve the scripts tailmon runs on it (own key + gate)
     tailmon.py tasks              the last 3 Todoist tasks each host ran (claude-explorer dispatch), read-only
     tailmon.py flows -w 2         live traffic between the hosts (also: tailmon.py -w 1 --flows)
+    tailmon.py htop               web page with an htop of every host, on http://localhost:8766/
 """
 import argparse
 import base64
@@ -1141,6 +1142,7 @@ def mount_main(argv):
 class Stream:
     """One long-lived probe per host that prints a sample every `interval` seconds; reconnects if it dies."""
     RETRY = 10.0
+    SCRIPT = PROBE
 
     def __init__(self, node, cfg, is_self, interval, flows=False):
         self.node, self.cfg, self.is_self, self.interval, self.flows = node, cfg, is_self, interval, flows
@@ -1150,12 +1152,17 @@ class Stream:
         if (self.proc and self.proc.poll() is None) or time.time() < self.retry_at:
             return
         self.retry_at = time.time() + self.RETRY
-        self.proc = subprocess.Popen(probe_cmd(self.node, self.cfg, self.is_self, self.interval, 0, self.flows),
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     universal_newlines=True, bufsize=1)
-        self.proc.stdin.write(PROBE)
-        self.proc.stdin.close()
+        self.proc = subprocess.Popen(self.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, universal_newlines=True, bufsize=1)
+        try:
+            self.proc.stdin.write(self.SCRIPT)
+            self.proc.stdin.close()
+        except OSError:
+            pass  # the command already died; _read reports its error
         threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def command(self):
+        return probe_cmd(self.node, self.cfg, self.is_self, self.interval, 0, self.flows)
 
     def _read(self, proc):
         for line in proc.stdout:
@@ -1166,6 +1173,8 @@ class Stream:
             self.received, self.seq = time.time(), self.seq + 1
         err = proc.stderr.read().splitlines()
         code = proc.wait()
+        if proc is not self.proc:
+            return  # stopped on purpose (or replaced): not an error
         self.latest = {"error": ssh_error(err, code)}
         self.received, self.seq = time.time(), self.seq + 1
 
@@ -1179,8 +1188,9 @@ class Stream:
         return dict(r, node=self.node["name"])
 
     def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
+        proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            proc.kill()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2047,6 +2057,451 @@ def serve_main(argv):
 
 
 # ---------------------------------------------------------------------------------------------
+# htop: a web page with an htop-like view of every host (cores, memory, processes), live. Each host streams
+# its process list over SSH only while the page is open.
+# ---------------------------------------------------------------------------------------------
+HTOP = r'''
+import json, os, pwd, re, socket, subprocess, sys, time
+INTERVAL = float(sys.argv[1]) if len(sys.argv) > 1 else 2.0
+TOP = int(sys.argv[2]) if len(sys.argv) > 2 else 40  # processes sent: the busiest by CPU, plus by memory
+names = {}
+
+def user(uid):
+    if uid not in names:
+        try:
+            names[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            names[uid] = str(uid)
+    return names[uid]
+
+def emit(d):
+    sys.stdout.write(json.dumps(d) + "\n")
+    sys.stdout.flush()
+
+def pick(rows):
+    """The TOP busiest by CPU, and the TOP biggest in memory, so the page can sort by either."""
+    keep = {r["pid"]: r for r in sorted(rows, key=lambda r: -r["cpu"])[:TOP]}
+    keep.update((r["pid"], r) for r in sorted(rows, key=lambda r: -r["res"])[:TOP])
+    return list(keep.values())
+
+def run(*cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                          timeout=10, env=dict(os.environ, LC_ALL="C")).stdout
+
+def linux():
+    tck, page = os.sysconf("SC_CLK_TCK"), os.sysconf("SC_PAGE_SIZE")
+
+    def cores():
+        out = []
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("cpu") and line[3:4].isdigit():
+                    v = [int(x) for x in line.split()[1:]]
+                    out.append((sum(v[:8]), v[3] + (v[4] if len(v) > 4 else 0)))
+        return out
+
+    def procs():
+        out = {}
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % pid) as f:
+                    st = f.read()
+                uid = os.stat("/proc/" + pid).st_uid
+            except OSError:
+                continue  # gone meanwhile
+            end = st.rindex(")")
+            p = st[end + 2:].split()  # p[n - 3] is field n of proc(5)
+            out[int(pid)] = {"s": p[0], "ticks": int(p[11]) + int(p[12]), "pri": int(p[15]), "ni": int(p[16]),
+                             "thr": int(p[17]), "virt": int(p[20]), "res": int(p[21]) * page, "uid": uid,
+                             "comm": st[st.index("(") + 1:end]}
+        return out
+
+    def memory():
+        m = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                m[k] = int(v.split()[0]) * 1024
+        cache = m.get("Buffers", 0) + m.get("Cached", 0) + m.get("SReclaimable", 0) - m.get("Shmem", 0)
+        return {"total": m["MemTotal"], "used": m["MemTotal"] - m["MemFree"] - cache, "cache": cache,
+                "swap_total": m.get("SwapTotal", 0), "swap_used": m.get("SwapTotal", 0) - m.get("SwapFree", 0)}
+
+    c0, p0, t0 = cores(), procs(), time.time()
+    deadline = t0
+    while True:
+        deadline += INTERVAL
+        time.sleep(max(0.0, deadline - time.time()))
+        c1, p1, t1 = cores(), procs(), time.time()
+        dt = max(t1 - t0, 1e-3)
+        mem = memory()
+        rows = []
+        for pid, v in p1.items():
+            old = p0.get(pid)
+            rows.append({"pid": pid, "user": user(v["uid"]), "pri": v["pri"], "ni": v["ni"], "virt": v["virt"],
+                         "res": v["res"], "s": v["s"], "thr": v["thr"],
+                         "cpu": 100.0 * (v["ticks"] - old["ticks"]) / tck / dt if old else 0.0,
+                         "mem": 100.0 * v["res"] / mem["total"], "time": v["ticks"] / float(tck),
+                         "comm": v["comm"]})
+        rows = pick(rows)
+        for r in rows:  # the full command line, only for the processes sent
+            try:
+                with open("/proc/%d/cmdline" % r["pid"], "rb") as f:
+                    cmd = f.read().rstrip(b"\0").replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                cmd = ""
+            r["cmd"] = cmd or "[%s]" % r["comm"]  # kernel threads have none
+        cores_pct = [100.0 * (1 - (i1 - i0) / max(a1 - a0, 1)) for (a0, i0), (a1, i1) in zip(c0, c1)]
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        emit({"hostname": socket.gethostname(), "time": t1, "cores": cores_pct,
+              "cpu": sum(cores_pct) / max(len(cores_pct), 1), "mem": mem, "load": os.getloadavg(),
+              "uptime": uptime, "tasks": len(p1), "threads": sum(v["thr"] for v in p1.values()),
+              "running": sum(1 for v in p1.values() if v["s"] == "R"), "procs": rows, "me": user(os.getuid())})
+        c0, p0, t0 = c1, p1, t1
+
+def seconds(text):
+    """ps times: '1:02.03', '01:02:03', '2-01:02:03'."""
+    days, _, rest = text.rpartition("-")
+    total = 0.0
+    for part in rest.split(":"):
+        total = total * 60 + float(part or 0)
+    return total + 86400 * int(days or 0)
+
+def macos():
+    total = int(run("sysctl", "-n", "hw.memsize").strip() or 0)
+    ncpu = os.cpu_count() or 1
+    boot = re.search(r"sec = (\d+)", run("sysctl", "-n", "kern.boottime"))
+    while True:
+        vm = run("vm_stat")
+        page = int((re.search(r"page size of (\d+)", vm) or [0, 4096])[1])
+        pages = dict((k.strip(), int(v.strip(" ."))) for k, v in re.findall(r"^([^:]+):\s+(\d+)\.?$", vm, re.M))
+        used = page * (pages.get("Pages active", 0) + pages.get("Pages wired down", 0) +
+                       pages.get("Pages occupied by compressor", 0))
+        cache = page * (pages.get("Pages inactive", 0) + pages.get("Pages purgeable", 0))
+        swap = re.findall(r"(\w+) = ([\d.]+)M", run("sysctl", "-n", "vm.swapusage"))
+        swap = dict((k, float(v) * 2**20) for k, v in swap)
+        rows = []
+        for line in run("ps", "-axo", "pid=,user=,pri=,nice=,vsz=,rss=,state=,%cpu=,%mem=,time=,command=").splitlines():
+            p = line.split(None, 10)
+            if len(p) < 11:
+                continue
+            rows.append({"pid": int(p[0]), "user": p[1], "pri": int(p[2]), "ni": int(p[3]), "virt": int(p[4]) * 1024,
+                         "res": int(p[5]) * 1024, "s": p[6][:1], "thr": None, "cpu": float(p[7]), "mem": float(p[8]),
+                         "time": seconds(p[9]), "comm": os.path.basename(p[10].split()[0]), "cmd": p[10]})
+        rows = pick(rows) if rows else rows
+        cpu = min(100.0, sum(r["cpu"] for r in rows) / ncpu)
+        emit({"hostname": socket.gethostname(), "time": time.time(), "cores": [], "cpu": cpu,
+              "mem": {"total": total, "used": used, "cache": cache, "swap_total": swap.get("total", 0),
+                      "swap_used": swap.get("used", 0)},
+              "load": os.getloadavg(), "uptime": time.time() - int(boot.group(1)) if boot else None,
+              "tasks": None, "threads": None, "running": None, "procs": rows, "me": user(os.getuid())})
+        time.sleep(INTERVAL)
+
+if sys.platform == "darwin":
+    macos()
+elif os.path.exists("/proc/stat"):
+    linux()
+else:
+    emit({"error": "htop: only Linux and macOS (%s)" % sys.platform})
+'''
+
+HTOP_OSES = ("linux", "macOS")
+HTOP_IDLE = 20.0  # seconds without a page asking: stop the streams, the hosts go back to costing nothing
+
+
+class HtopStream(Stream):
+    SCRIPT = HTOP
+
+    def __init__(self, node, cfg, is_self, interval, top):
+        Stream.__init__(self, node, cfg, is_self, interval)
+        self.top = top
+
+    def command(self):
+        args = [self.interval, self.top]
+        if self.is_self:
+            return [sys.executable, "-"] + [str(x) for x in args]
+        return python_cmd(self.node, self.cfg, args, keepalive=True)
+
+
+HTOP_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tailnet htop</title>
+<style>
+:root { --bg:#f4f5f7; --card:#fff; --fg:#1c2230; --muted:#6a7284; --line:#e0e3ea; --head:#eef0f4;
+  --ok:#2f9e44; --warn:#d9a400; --bad:#d6336c; --cache:#e8b931; --swap:#c2255c; --low:#4c6ef5; --sel:#e7efff;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#0f1115; --card:#171a21; --fg:#e4e7ee;
+  --muted:#8b93a5; --line:#262b35; --head:#1d212a; --ok:#51cf66; --warn:#fcc419; --bad:#ff6b9a; --cache:#f0c541;
+  --swap:#f06595; --low:#748ffc; --sel:#1f2a40; } }
+:root[data-theme="dark"] { --bg:#0f1115; --card:#171a21; --fg:#e4e7ee; --muted:#8b93a5; --line:#262b35;
+  --head:#1d212a; --ok:#51cf66; --warn:#fcc419; --bad:#ff6b9a; --cache:#f0c541; --swap:#f06595; --low:#748ffc; --sel:#1f2a40; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
+header { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line);
+  display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 16px; }
+h1 { font-size:17px; margin:0 8px 0 0; } .sub { color:var(--muted); font-size:13px; flex:1; min-width:120px; }
+input, select, button { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--line);
+  border-radius:7px; padding:5px 9px; } input { width:200px; max-width:100%; } button { cursor:pointer; }
+button.on { background:var(--low); border-color:var(--low); color:#fff; }
+main { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(100%, 620px), 1fr)); gap:12px; padding:12px 16px; }
+.host { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; min-width:0; }
+.host.wide { grid-column:1 / -1; }
+.top { display:flex; flex-wrap:wrap; gap:4px 14px; align-items:baseline; padding:9px 12px 6px; cursor:pointer; }
+.name { font-weight:650; font-size:15px; } .meta { color:var(--muted); font-size:12.5px; font-variant-numeric:tabular-nums; }
+.meters { padding:0 12px 8px; font-family:var(--mono); font-size:11.5px; }
+.cores { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:2px 12px; margin-bottom:5px; }
+.m { display:flex; align-items:center; gap:6px; min-width:0; } .m b { font-weight:600; width:3.2em; color:var(--muted); text-align:right; flex:none; }
+.track { flex:1; height:9px; background:var(--head); border-radius:3px; overflow:hidden; display:flex; min-width:20px; }
+.track i { display:block; height:100%; } .m span { width:9.5em; text-align:right; flex:none; color:var(--muted); white-space:nowrap; }
+.cores .m span { width:3.4em; }
+.cells { display:grid; grid-template-columns:repeat(auto-fill, 11px); gap:2px; margin:2px 0 6px; }
+.cells i { height:18px; border-radius:2px; background:var(--head); display:flex; align-items:flex-end; overflow:hidden; }
+.cells i u { display:block; width:100%; }
+.cellnote { color:var(--muted); margin:0 0 4px; }
+.tablewrap { overflow-x:auto; border-top:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; font-family:var(--mono); font-size:11.5px; font-variant-numeric:tabular-nums; }
+th { background:var(--head); color:var(--muted); font-weight:600; text-align:right; padding:3px 6px; cursor:pointer;
+  white-space:nowrap; user-select:none; position:sticky; top:0; } th.sorted { color:var(--fg); background:var(--sel); }
+td { padding:1px 6px; text-align:right; white-space:nowrap; border-top:1px solid transparent; }
+th.l, td.l { text-align:left; } td.cmd { text-align:left; max-width:0; width:100%; overflow:hidden; text-overflow:ellipsis; }
+tr:hover td { background:var(--sel); } td.hot { color:var(--bad); font-weight:600; } td.warm { color:var(--warn); }
+td.other { color:var(--low); } .state-R { color:var(--ok); font-weight:600; } .state-D { color:var(--bad); font-weight:600; }
+.base { color:var(--fg); } .args { color:var(--muted); }
+.err { color:var(--bad); padding:4px 12px 12px; } .pending { color:var(--muted); padding:4px 12px 12px; }
+.more { color:var(--muted); font-size:12px; padding:4px 12px 8px; }
+#skipped { color:var(--muted); font-size:12.5px; padding:0 16px 16px; }
+</style></head><body>
+<header><h1>htop</h1><span class="sub" id="sub">connecting…</span>
+<input id="filter" type="search" placeholder="filter: command, user, pid" autocomplete="off">
+<select id="rows" title="processes per host"><option>10</option><option selected>15</option><option>25</option><option>40</option></select>
+<button id="pause" title="stop refreshing (the hosts stop streaming after a few seconds)">Pause</button></header>
+<main id="hosts"></main><div id="skipped"></div>
+<script>
+const qs = location.search, $ = id => document.getElementById(id);
+const COLS = [["pid","PID"],["user","USER","l"],["pri","PRI"],["ni","NI"],["virt","VIRT"],["res","RES"],["s","S"],
+              ["cpu","CPU%"],["mem","MEM%"],["time","TIME+"],["cmd","Command","l"]];
+let sortKey = "cpu", paused = false, wide = new Set(), data = null, timer = null;
+try { sortKey = localStorage.getItem("htop.sort") || "cpu"; $("rows").value = localStorage.getItem("htop.rows") || "15"; } catch (e) {}
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function size(n) { if (n == null) return ""; const u = ["B","K","M","G","T","P"]; let i = 0;
+  while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i && n < 10 ? n.toFixed(1) : Math.round(n)) + u[i]; }
+function cputime(t) { if (t == null) return ""; const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+  return h ? h + "h" + String(m).padStart(2, "0") + ":" + String(Math.floor(s)).padStart(2, "0")
+           : m + ":" + s.toFixed(2).padStart(5, "0"); }
+function uptime(t) { if (t == null) return ""; const d = Math.floor(t / 86400), h = Math.floor(t % 86400 / 3600), m = Math.floor(t % 3600 / 60);
+  return (d ? d + "d " : "") + String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0"); }
+const level = p => p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--ok)";
+function meter(label, parts, text) {
+  return '<div class="m"><b>' + label + '</b><div class="track">' +
+    parts.map(([p, color]) => '<i style="width:' + Math.max(0, Math.min(100, p)).toFixed(1) + '%;background:' + color + '"></i>').join("") +
+    '</div><span>' + text + '</span></div>'; }
+function compare(a, b) { const x = a[sortKey], y = b[sortKey];
+  if (typeof x === "string" || typeof y === "string") return String(x).localeCompare(String(y));
+  return sortKey === "pid" ? x - y : (y || 0) - (x || 0); }
+function procRow(p, me) {
+  const cls = p.cpu >= 90 ? "hot" : p.cpu >= 40 ? "warm" : "";
+  const base = esc(p.cmd).split(" ")[0], args = esc(p.cmd).slice(base.length);
+  return "<tr><td>" + p.pid + '</td><td class="l' + (p.user !== me && p.user !== "root" ? " other" : "") + '">' + esc(p.user).slice(0, 10) +
+    "</td><td>" + p.pri + "</td><td>" + p.ni + "</td><td>" + size(p.virt) + "</td><td>" + size(p.res) +
+    '</td><td class="state-' + esc(p.s) + '">' + esc(p.s) + '</td><td class="' + cls + '">' + p.cpu.toFixed(1) +
+    "</td><td>" + p.mem.toFixed(1) + "</td><td>" + cputime(p.time) + '</td><td class="cmd" title="' + esc(p.cmd) + '">' +
+    '<span class="base">' + base + '</span><span class="args">' + args + "</span></td></tr>"; }
+function card(h) {
+  const isWide = wide.has(h.node);
+  let html = '<div class="top" data-host="' + esc(h.node) + '" title="click: full width, more rows"><span class="name">' + esc(h.node) + "</span>";
+  if (h.error) return html + '</div><div class="err">' + esc(h.error) + "</div>";
+  if (h.pending) return html + '</div><div class="pending">' + esc(h.pending) + "</div>";
+  const tasks = h.tasks != null ? "Tasks " + h.tasks + ", " + h.threads + " thr; " + h.running + " running" : "";
+  html += '<span class="meta">' + [tasks, "Load " + h.load.map(x => x.toFixed(2)).join(" "),
+    h.uptime != null ? "Uptime " + uptime(h.uptime) : ""].filter(Boolean).join(" · ") + "</span></div>";
+  html += '<div class="meters">';
+  if (h.cores.length > 24) {  // many cores: one small gauge each, the overall CPU as a bar
+    html += meter("CPU", [[h.cpu, level(h.cpu)]], h.cpu.toFixed(1) + "% of " + h.cores.length);
+    html += '<div class="cells">' + h.cores.map((p, i) => '<i title="core ' + i + ": " + p.toFixed(0) + '%"><u style="height:' +
+      Math.max(p > 0.5 ? 8 : 0, Math.min(100, p)).toFixed(0) + "%;background:" + level(p) + '"></u></i>').join("") + "</div>";
+    const busy = h.cores.filter(p => p >= 50).length;
+    html += '<div class="cellnote">' + busy + " of " + h.cores.length + " cores over 50%</div>";
+  } else if (h.cores.length) html += '<div class="cores">' + h.cores.map((p, i) => meter(i, [[p, level(p)]], p.toFixed(0) + "%")).join("") + "</div>";
+  else html += meter("CPU", [[h.cpu, level(h.cpu)]], h.cpu.toFixed(1) + "%");
+  const m = h.mem;
+  html += meter("Mem", [[100 * m.used / m.total, "var(--ok)"], [100 * m.cache / m.total, "var(--cache)"]],
+                size(m.used) + " / " + size(m.total));
+  if (m.swap_total) html += meter("Swp", [[100 * m.swap_used / m.swap_total, "var(--swap)"]], size(m.swap_used) + " / " + size(m.swap_total));
+  html += "</div>";
+  const f = $("filter").value.trim().toLowerCase();
+  let procs = h.procs.filter(p => !f || (p.cmd + " " + p.user + " " + p.pid).toLowerCase().includes(f)).sort(compare);
+  const n = isWide ? procs.length : +$("rows").value, shown = procs.slice(0, n);
+  html += '<div class="tablewrap"><table><thead><tr>' + COLS.map(([k, t, l]) =>
+    '<th data-sort="' + k + '" class="' + (l || "") + (k === sortKey ? " sorted" : "") + '">' + t + "</th>").join("") +
+    "</tr></thead><tbody>" + shown.map(p => procRow(p, h.me)).join("") + "</tbody></table></div>";
+  if (procs.length > n) html += '<div class="more">' + (procs.length - n) + " more (click the host name)</div>";
+  else if (!procs.length) html += '<div class="more">no matching process among the busiest</div>';
+  return html; }
+function render() {
+  if (!data) return;
+  const el = $("hosts");
+  const keep = new Map([...el.children].map(c => [c.dataset.host, c]));
+  data.hosts.forEach(h => {
+    let d = keep.get(h.node);
+    if (!d) { d = document.createElement("section"); d.className = "host"; d.dataset.host = h.node; }
+    keep.delete(h.node);
+    d.classList.toggle("wide", wide.has(h.node));
+    d.innerHTML = card(h);
+    el.append(d); });
+  keep.forEach(d => d.remove());
+  const ok = data.hosts.filter(h => !h.error && !h.pending).length;
+  $("sub").textContent = ok + "/" + data.hosts.length + " hosts · every " + data.interval + " s" + (paused ? " · paused" : "");
+  $("skipped").textContent = data.skipped.length ? "not shown: " + data.skipped.join(", ") : "";
+  if (!data.hosts.length) el.innerHTML = '<div class="pending">No host.</div>'; }
+async function load() {
+  clearTimeout(timer);
+  if (paused || document.hidden) return;
+  try { const r = await fetch("/api/htop" + qs); if (!r.ok) throw new Error(await r.text()); data = await r.json(); render(); }
+  catch (e) { $("sub").textContent = "error: " + (e.message || e); }
+  timer = setTimeout(load, 1000 * ((data && data.interval) || 2)); }
+document.addEventListener("click", e => {
+  const th = e.target.closest("th[data-sort]");
+  if (th) { sortKey = th.dataset.sort; try { localStorage.setItem("htop.sort", sortKey); } catch (_) {} render(); return; }
+  const top = e.target.closest(".top");
+  if (top) { const h = top.dataset.host; wide.has(h) ? wide.delete(h) : wide.add(h); render(); } });
+$("filter").oninput = render;
+$("rows").onchange = () => { try { localStorage.setItem("htop.rows", $("rows").value); } catch (_) {} render(); };
+$("pause").onclick = () => { paused = !paused; $("pause").classList.toggle("on", paused);
+  $("pause").textContent = paused ? "Resume" : "Pause"; paused ? render() : load(); };
+document.addEventListener("visibilitychange", load);
+load();
+</script></body></html>
+'''
+
+
+def htop_main(argv):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+    ap = argparse.ArgumentParser(prog="tailmon htop",
+                                 description="Web page with an htop of every Linux and macOS host, live")
+    ap.add_argument("--bind", metavar="ADDR",
+                    help="only listen on this address (default: this PC and its Tailscale address, so every "
+                         "tailnet machine can open http://<this-pc>:PORT/ and nothing else can; process lists "
+                         "show every command line, so think twice before 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=8766)
+    ap.add_argument("--token", help="require ?token=TOKEN (or an X-Token header) on every request")
+    ap.add_argument("--hosts", help="comma-separated Tailscale hostnames to show")
+    ap.add_argument("--exclude", metavar="LIST", help="comma-separated Tailscale hostnames to leave out")
+    ap.add_argument("-w", "--interval", type=float, default=2.0, metavar="SEC",
+                    help="refresh every SEC seconds (default %(default)g)")
+    ap.add_argument("-n", "--processes", type=int, default=40, metavar="N",
+                    help="processes sent per host: the N busiest by CPU and the N biggest in memory "
+                         "(default %(default)d)")
+    ap.add_argument("--no-browser", action="store_true", help="don't open the page in a browser")
+    a = ap.parse_args(argv[1:])
+    if a.interval < 0.5 or a.processes < 1:
+        ap.error("--interval must be at least 0.5 and --processes at least 1")
+    cfg = load_config()
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    exclude = set(x for x in a.exclude.split(",") if x) if a.exclude else set()
+    streams, lock = {}, threading.Lock()
+    state = {"skipped": [], "discovered": 0.0, "asked": 0.0}
+
+    def rediscover():
+        targets, skipped = targets_for(cfg, only, exclude, HTOP_OSES)
+        names = {n["name"] for n, _ in targets}
+        for name in set(streams) - names:
+            streams.pop(name).stop()
+        for n, is_self in targets:
+            if n["name"] not in streams:
+                streams[n["name"]] = HtopStream(n, cfg, is_self, a.interval, a.processes)
+        state["skipped"] = sorted("%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped)
+        state["discovered"] = time.time()
+
+    def snapshot():
+        with lock:
+            state["asked"] = time.time()
+            if time.time() - state["discovered"] >= cfg["discover_seconds"]:
+                try:
+                    rediscover()
+                except (OSError, ValueError, subprocess.CalledProcessError):
+                    pass  # tailscale hiccup: keep the current hosts
+            for s in streams.values():
+                s.ensure()
+            hosts = sorted((s.result() for s in streams.values()), key=lambda r: (not streams[r["node"]].is_self,
+                                                                                   r["node"]))
+            return {"hosts": hosts, "skipped": state["skipped"], "interval": a.interval}
+
+    def reaper():
+        # Nobody looking (tab closed, hidden or paused): stop every stream, so the hosts do no work.
+        while True:
+            time.sleep(5)
+            with lock:
+                if time.time() - state["asked"] > HTOP_IDLE:
+                    for s in streams.values():
+                        if s.proc:
+                            s.stop()
+                            s.latest, s.retry_at = None, 0.0
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, code, body, ctype="application/json"):
+            data = (body if isinstance(body, str) else json.dumps(body)).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            url = urlparse(self.path)
+            if a.token and a.token not in parse_qs(url.query).get("token", []) \
+                    and self.headers.get("X-Token") != a.token:
+                return self.reply(403, {"error": "forbidden: add ?token=..."})
+            if url.path == "/":
+                return self.reply(200, HTOP_PAGE, "text/html")
+            if url.path == "/api/htop":
+                return self.reply(200, snapshot())
+            self.reply(404, {"error": "not found"})
+
+        def log_message(self, fmt, *args):
+            pass  # one poll per refresh: too chatty for the terminal
+
+    with lock:
+        rediscover()
+    threading.Thread(target=reaper, daemon=True).start()
+    # By default, this PC and the tailnet: one listener on localhost, one on the Tailscale address(es).
+    me = TAILNET[0] if TAILNET else {}
+    binds = [a.bind] if a.bind else ["127.0.0.1"] + [ip for ip in me.get("ips") or [] if ":" not in ip]
+    servers = []
+    for addr in binds:
+        try:
+            servers.append(ThreadingHTTPServer((addr, a.port), Handler))
+        except OSError as e:
+            print("tailmon: can't listen on %s:%d: %s" % (addr, a.port, e.strerror or e), file=sys.stderr)
+    if not servers:
+        sys.exit(1)
+    token = "?token=" + a.token if a.token else ""
+    local = "http://%s:%d/%s" % ("localhost" if binds[0] in ("0.0.0.0", "::", "127.0.0.1") else binds[0],
+                                 a.port, token)
+    print("tailmon: htop of %d hosts on %s" % (len(streams), local), file=sys.stderr)
+    if len(servers) > 1 or binds[0] in ("0.0.0.0", "::"):
+        print("         from the tailnet: http://%s:%d/%s" % (me.get("name") or me.get("ip"), a.port, token),
+              file=sys.stderr)
+    print("         Ctrl-C to stop", file=sys.stderr)
+    if not a.no_browser:
+        import webbrowser
+        threading.Thread(target=webbrowser.open, args=(local,), daemon=True).start()
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        servers[0].serve_forever()
+    finally:
+        for server in servers:
+            server.server_close()
+        for s in streams.values():
+            s.stop()
+
+
+# ---------------------------------------------------------------------------------------------
 # Gate: each host approves the scripts tailmon may run on it. tailmon gets its own SSH key, which the
 # host's authorized_keys ties to a forced command (the gate); the gate runs a script sent on stdin only
 # if its SHA-256 is in the host's approved list, so that key can do nothing else (no shell, no
@@ -2267,7 +2722,8 @@ def gate_scripts():
     """{sha256: name} of the scripts this tailmon sends over a gate, hashed as they go down the pipe."""
     enc = locale.getpreferredencoding(False)
     return {hashlib.sha256(text.encode(enc)).hexdigest(): "%s %s" % (name, time.strftime("%Y-%m-%d"))
-            for name, text in (("probe", PROBE), ("file-tool", FILE_TOOL), ("volume", VOLUME))}
+            for name, text in (("probe", PROBE), ("file-tool", FILE_TOOL), ("volume", VOLUME),
+                                               ("htop", HTOP))}
 
 
 def gate_names():
@@ -2710,6 +3166,8 @@ def main():
         return volume_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         return serve_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "htop":
+        return htop_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "gate":
         return gate_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "tasks":

@@ -13,6 +13,16 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-hosts
 .IR LIST ]
 .br
+.B tailmon htop
+.RB [ \-w
+.IR SEC ]
+.RB [ \-\-hosts
+.IR LIST ]
+.RB [ \-\-bind
+.IR ADDR ]
+.RB [ \-\-token
+.IR TOKEN ]
+.br
 .B tailmon flows
 .RB [ \-w
 .IR SEC ]
@@ -334,6 +344,48 @@ Windows hosts (with the OpenSSH server) are driven through PowerShell and the Co
 Android hosts need Termux with sshd, python and Termux:API, and get their media volume set.
 Takes
 .BR \-\-hosts ", " \-\-exclude " and " \-\-json .
+.SS "htop"
+Serve a web page with an htop of every online Linux and macOS host, side by side, and open it in a
+browser: per\-core CPU, memory, swap, load, uptime and the busiest processes (PID, USER, PRI, NI, VIRT,
+RES, S, CPU%, MEM%, TIME+, Command), sortable and filterable. Each host streams its process list over one
+SSH session, only while the page is open: after 20 seconds with no request, the streams stop.
+Linux hosts are read from
+.IR /proc ;
+macOS hosts with
+.BR ps (1),
+.B vm_stat
+and
+.BR sysctl .
+.TP
+.BI \-\-bind " ADDR"
+Listen only on this address. By default the page listens on 127.0.0.1 and on this PC\(aqs Tailscale
+address, so every tailnet machine can open
+.BI http:// this\-pc :8766/
+and the LAN cannot. Process lists show every command line.
+.TP
+.BI \-\-port " PORT"
+Default 8766.
+.TP
+.BI \-\-token " TOKEN"
+Require
+.BI ?token= TOKEN
+or an
+.B X\-Token
+header on every request.
+.TP
+.BI \-\-hosts " LIST" "\fR, \fP\-\-exclude" " LIST"
+Hosts to show, or to leave out.
+.TP
+.BR \-w ", " \-\-interval " \fISEC\fR"
+Refresh every
+.I SEC
+seconds (default 2).
+.TP
+.BR \-n ", " \-\-processes " \fIN\fR"
+Processes each host sends: its N busiest by CPU and its N biggest in memory (default 40).
+.TP
+.B \-\-no\-browser
+Only print the address.
 .SS "serve"
 Serve a web page with a volume slider and mute button per host, and a JSON API
 .RB ( "GET /api/volume" ,
@@ -408,7 +460,7 @@ default
 .IR ~/.ssh/tailmon_gate )
 here if needed; on each host, copy the gate to
 .IR ~/.local/share/tailmon/gate.py ,
-approve this version\(aqs scripts (monitoring probe, file tool, volume) in
+approve this version\(aqs scripts (monitoring probe, file tool, volume, htop) in
 .IR ~/.config/tailmon/approved ,
 back up
 .I ~/.ssh/authorized_keys
@@ -731,6 +783,9 @@ Live view with a desktop notification when anything overheats.
 .TP
 .B tailmon flows \-w 2
 Live traffic between the hosts.
+.TP
+.B tailmon htop
+An htop of every host in the browser.
 .TP
 .B tailmon \-w 1 \-\-flows
 The usual live view with the FLOWS section at the bottom.
