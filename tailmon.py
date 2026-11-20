@@ -1477,8 +1477,20 @@ def lyx_graphics(lines):
 
 
 def sshfs_sources():
-    """{mount point: (ssh host spec, remote dir)} for the sshfs mounts in /proc/mounts."""
+    """{mount point: (ssh host spec, remote dir)} for the sshfs mounts: /proc/mounts on Linux; on macOS,
+    whose FUSE-T mounts only show `fuse-t:/<name>`, the running `sshfs HOST:DIR POINT ...` processes."""
     out = {}
+    if not os.path.exists("/proc/mounts"):
+        ps = subprocess.run(["ps", "-ax", "-o", "command="], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        mounted = mounted_paths()
+        for line in ps.splitlines():
+            args = line.split()
+            if len(args) >= 3 and os.path.basename(args[0]) == "sshfs" and ":" in args[1]:
+                host, remote = args[1].split(":", 1)
+                point = args[2].rstrip("/") or "/"
+                if point in mounted:
+                    out[point] = (host, remote or "/")
+        return out
     with open("/proc/mounts") as f:
         for line in f:
             src, point, fstype = line.split()[:3]
