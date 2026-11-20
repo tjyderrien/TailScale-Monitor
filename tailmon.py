@@ -2054,66 +2054,212 @@ def volume_main(argv):
 
 VOLUME_PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Tailnet Volume</title>
+<title>Tailnet Mixer</title>
 <style>
-:root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7385; --accent:#3b6fe0; --line:#e1e4ea; --bad:#c43c3c; }
-@media (prefers-color-scheme: dark) { :root { --bg:#14171d; --card:#1e222a; --fg:#e6e9ef; --muted:#8d95a6;
-  --accent:#6d97f5; --line:#2c313b; --bad:#ef6b6b; } }
+:root { --bg:#cfd3d7; --fg:#1d2330; --muted:#59616e;
+  --panel:#4b5763; --panel-hi:#62707e; --panel-lo:#333c45; --ink:#eef1f3; --ink-dim:#a9b3bd;
+  --seam:#252c33; --scribble:#efe7cf; --scribble-ink:#24262a;
+  --vu-face:#f1e3bd; --vu-ink:#2a2a2a; --vu-red:#c2362f; --needle:#161616;
+  --mute:#ff4a3a; --mute-off:#5b2723; --solo:#ffc21a; --solo-off:#5b4b17; --led:#6dff5e; --led-off:#1f3a1c;
+  --cap:#d4d7da; --slot:#101316; --master:#6b3b36; --master-hi:#83504a; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#0f1215; --fg:#e6e9ef; --muted:#8d95a6; } }
+:root[data-theme="dark"] { --bg:#0f1215; --fg:#e6e9ef; --muted:#8d95a6; }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; }
-main { max-width:640px; margin:0 auto; padding:20px 16px; }
-h1 { font-size:20px; margin:0 0 4px; } .sub { color:var(--muted); margin:0 0 18px; font-size:13px; }
-.host { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin-bottom:10px; }
-.top { display:flex; align-items:center; gap:10px; } .name { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; }
-.pct { font-variant-numeric:tabular-nums; width:3.5em; text-align:right; color:var(--muted); }
-.row { display:flex; align-items:center; gap:10px; margin-top:8px; }
-input[type=range] { flex:1; accent-color:var(--accent); min-width:0; }
-button { border:1px solid var(--line); background:var(--bg); color:var(--fg); border-radius:8px; padding:6px 10px; font:inherit; cursor:pointer; }
-button.on { background:var(--bad); border-color:var(--bad); color:#fff; }
-.err { color:var(--bad); font-size:13px; margin-top:6px; } .backend { color:var(--muted); font-size:12px; }
-.muted input[type=range] { opacity:.4; }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,sans-serif; }
+main { max-width:1200px; margin:0 auto; padding:18px 16px 28px; }
+header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+h1 { font-size:19px; margin:0; letter-spacing:.02em; } .sub { color:var(--muted); font-size:13px; }
+.sub a { color:inherit; }
+.desk { display:flex; overflow-x:auto; border-radius:10px; padding:10px 8px 14px;
+  background:linear-gradient(180deg,var(--panel-hi),var(--panel) 12%,var(--panel) 88%,var(--panel-lo));
+  box-shadow:0 1px 0 #ffffff30 inset, 0 10px 30px #0006, 0 0 0 1px #0008; }
+.desk > .note { color:var(--ink); padding:8px; }
+.strip { flex:0 0 104px; display:flex; flex-direction:column; align-items:center; gap:9px; padding:6px 7px 8px;
+  border-right:2px solid var(--seam); box-shadow:1px 0 0 #ffffff18; color:var(--ink); position:relative; }
+.strip:last-child { border-right:0; box-shadow:none; }
+.strip.master { background:linear-gradient(180deg,var(--master-hi),var(--master)); border-radius:6px; margin-left:8px; }
+.strip.err > :not(.scribble):not(.led) { opacity:.25; pointer-events:none; }
+.strip.muted .vu, .strip.muted .fader { filter:saturate(.3) brightness(.75); }
+.led { position:absolute; top:6px; right:7px; width:7px; height:7px; border-radius:50%; background:var(--led-off); }
+.busy .led { background:var(--led); box-shadow:0 0 6px var(--led); animation:blink .5s infinite alternate; }
+.err .led { background:var(--mute); box-shadow:0 0 6px var(--mute); }
+@keyframes blink { to { opacity:.35; } }
+.vu { width:88px; height:56px; border-radius:4px; background:var(--vu-face); box-shadow:0 0 0 2px #0009, 0 2px 6px #0007 inset; }
+.vu .needle { transition:transform .45s cubic-bezier(.3,1.4,.5,1); transform-origin:50px 62px; }
+.scribble { width:100%; height:40px; background:var(--scribble); color:var(--scribble-ink); border-radius:2px; padding:3px 4px 2px;
+  text-align:center; font:600 12px/1.25 "Marker Felt","Comic Sans MS",cursive; box-shadow:0 1px 2px #0008;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.scribble small { display:block; font:10px/1.2 ui-monospace,monospace; color:#6a6458; overflow:hidden; text-overflow:ellipsis; }
+.err .scribble small { color:#b0352c; white-space:normal; max-height:2.4em; }
+.btns { display:flex; gap:6px; }
+.key { width:38px; height:26px; border:0; border-radius:3px; font:700 10px/1 system-ui,sans-serif; letter-spacing:.06em;
+  cursor:pointer; color:#fff9; box-shadow:0 2px 0 #000a, 0 0 0 1px #000 inset; transition:background .12s,box-shadow .12s; }
+.key.mute { background:var(--mute-off); } .key.solo { background:var(--solo-off); }
+.key.mute.on { background:var(--mute); color:#fff; box-shadow:0 0 12px var(--mute), 0 0 0 1px #000 inset; }
+.key.solo.on { background:var(--solo); color:#3a2c00; box-shadow:0 0 12px var(--solo), 0 0 0 1px #000 inset; }
+.key:active { transform:translateY(1px); box-shadow:0 1px 0 #000a, 0 0 0 1px #000 inset; }
+.key:focus-visible, .fader:focus-visible { outline:2px solid var(--solo); outline-offset:2px; }
+.fader { position:relative; width:72px; height:230px; touch-action:none; cursor:ns-resize; outline:none; --v:0; }
+.fader .scale { position:absolute; left:0; top:15px; bottom:15px; width:24px; }
+.fader .scale span { position:absolute; right:0; transform:translateY(-50%); font:9px/1 ui-monospace,monospace; color:var(--ink-dim); }
+.fader .scale span::after { content:""; display:inline-block; width:6px; height:1px; background:var(--ink-dim); margin-left:3px; vertical-align:middle; }
+.fader .slot { position:absolute; left:40px; top:12px; bottom:12px; width:6px; border-radius:3px; background:var(--slot);
+  box-shadow:0 1px 0 #ffffff25; }
+.fader .cap { position:absolute; left:26px; width:34px; height:30px; border-radius:3px;
+  top:calc((100 - var(--v)) * (100% - 30px) / 100);
+  background:linear-gradient(180deg,#f3f4f5,var(--cap) 30%,#9fa4a9 50%,var(--cap) 70%,#eceef0);
+  box-shadow:0 3px 5px #000b, 0 0 0 1px #000a; }
+.fader .cap::after { content:""; position:absolute; left:3px; right:3px; top:14px; height:2px; background:#1b1b1b; }
+.master .fader .cap::after { background:#d22; }
+.readout { width:64px; padding:3px 0; border-radius:3px; background:#0b0d0f; color:#ff6a3d; text-align:center;
+  font:700 15px/1 ui-monospace,"SF Mono",Menlo,monospace; letter-spacing:.08em; box-shadow:0 0 0 1px #000, 0 1px 0 #ffffff20; text-shadow:0 0 6px #ff4a1a90; }
+.muted .readout { color:#7a3a28; text-shadow:none; }
+.label { font:700 9px/1 system-ui,sans-serif; letter-spacing:.14em; color:var(--ink-dim); }
+.note { color:var(--muted); font-size:12px; margin-top:10px; }
 </style></head><body><main>
-<h1>Volume</h1><p class="sub">Every online Linux host on the tailnet · <a href="#" id="reload">refresh</a></p>
-<div id="hosts">Loading…</div>
+<header><h1>Tailnet Mixer</h1>
+<span class="sub">one channel per host · SOLO mutes the others · <a href="#" id="reload">refresh</a></span></header>
+<div class="desk" id="desk"><div class="note">Loading…</div></div>
+<p class="note">The meters show each host's volume setting, not live audio. A fader is sent when you let go of it.</p>
 </main><script>
-const el = document.getElementById("hosts");
+const desk = document.getElementById("desk");
+const strips = new Map();          // host -> strip state
+let soloed = new Set(), savedMute = null, master = null;
+
 async function api(path, body) {
-  const r = await fetch(path + location.search, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
+  const r = await fetch(path + location.search, body ? {method:"POST", headers:{"Content-Type":"application/json"},
+                                                       body:JSON.stringify(body)} : {});
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
-function card(h) {
-  const d = document.createElement("div"); d.className = "host"; d.dataset.host = h.host;
-  fill(d, h); return d;
+function E(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function note(text) { desk.innerHTML = ""; desk.append(E("div", "note", text)); }
+const NS = "http://www.w3.org/2000/svg";
+function S(tag, attrs) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+const ang = v => -50 + v;          // 0..100 -> -50..+50 degrees
+function vu() {
+  const svg = S("svg", {viewBox:"0 0 100 60", class:"vu", "aria-hidden":"true"});
+  const pt = (v, r) => { const a = ang(v) * Math.PI / 180; return [50 + r * Math.sin(a), 62 - r * Math.cos(a)]; };
+  const [x1, y1] = pt(80, 44), [x2, y2] = pt(100, 44);
+  svg.append(S("path", {d:`M${x1} ${y1} A44 44 0 0 1 ${x2} ${y2}`, stroke:"var(--vu-red)", "stroke-width":4, fill:"none"}));
+  for (let v = 0; v <= 100; v += 10) {
+    const [a, b] = pt(v, 40), [c, d] = pt(v, v % 50 ? 44 : 47);
+    svg.append(S("line", {x1:a, y1:b, x2:c, y2:d, stroke:v >= 80 ? "var(--vu-red)" : "var(--vu-ink)", "stroke-width":v % 50 ? .8 : 1.4}));
+  }
+  for (const v of [0, 50, 100]) { const [x, y] = pt(v, 32); const t = S("text", {x, y:y + 2, "text-anchor":"middle",
+    "font-size":7, fill:"var(--vu-ink)", "font-family":"ui-monospace,monospace"}); t.textContent = v; svg.append(t); }
+  const t = S("text", {x:50, y:50, "text-anchor":"middle", "font-size":8, "font-weight":700, fill:"var(--vu-ink)",
+                       "letter-spacing":"1", "font-family":"system-ui,sans-serif"}); t.textContent = "VOL"; svg.append(t);
+  const n = S("g", {class:"needle"}); n.append(S("line", {x1:50, y1:62, x2:50, y2:16, stroke:"var(--needle)", "stroke-width":1.1}));
+  svg.append(n, S("circle", {cx:50, cy:62, r:5, fill:"#222"}));
+  return {el:svg, set(v) { n.style.transform = `rotate(${ang(v)}deg)`; }};
 }
-function fill(d, h) {
-  d.innerHTML = "";
-  d.classList.toggle("muted", !!h.muted);
-  const top = document.createElement("div"); top.className = "top";
-  const name = document.createElement("span"); name.className = "name"; name.textContent = h.host;
-  const be = document.createElement("span"); be.className = "backend"; be.textContent = h.backend || "";
-  top.append(name, be); d.append(top);
-  if (h.error) { const e = document.createElement("div"); e.className = "err"; e.textContent = h.error; d.append(e); return; }
-  const row = document.createElement("div"); row.className = "row";
-  const mute = document.createElement("button"); mute.textContent = h.muted ? "Muted" : "Mute"; mute.className = h.muted ? "on" : "";
-  const range = document.createElement("input"); range.type = "range"; range.min = 0; range.max = 100; range.value = h.volume;
-  const pct = document.createElement("span"); pct.className = "pct"; pct.textContent = h.volume + "%";
-  range.oninput = () => pct.textContent = range.value + "%";
-  range.onchange = () => send(d, {action:"set", value:+range.value});
-  mute.onclick = () => send(d, {action:"toggle"});
-  row.append(mute, range, pct); d.append(row);
+function fader(label, oninput, commit) {
+  const f = E("div", "fader"); f.tabIndex = 0; f.setAttribute("role", "slider");
+  f.setAttribute("aria-label", label); f.setAttribute("aria-valuemin", 0); f.setAttribute("aria-valuemax", 100);
+  const scale = E("div", "scale");
+  for (let v = 0; v <= 100; v += 10) { const s = E("span", "", v % 20 ? "" : v); s.style.top = (100 - v) + "%"; scale.append(s); }
+  const cap = E("div", "cap"); f.append(scale, E("div", "slot"), cap);
+  let v = 0, timer = null, dragging = false;
+  const show = x => { v = Math.max(0, Math.min(100, Math.round(x))); f.style.setProperty("--v", v);
+                      f.setAttribute("aria-valuenow", v); oninput(v); };
+  const later = () => { clearTimeout(timer); timer = setTimeout(() => commit(v), 450); };
+  const fromY = e => { const r = f.getBoundingClientRect(); return (1 - (e.clientY - r.top - 15) / (r.height - 30)) * 100; };
+  f.onpointerdown = e => { dragging = true; f.setPointerCapture(e.pointerId); f.focus();
+    if (e.target !== cap) show(fromY(e)); e.preventDefault(); };
+  f.onpointermove = e => { if (dragging) show(fromY(e)); };
+  f.onpointerup = f.onpointercancel = () => { if (dragging) { dragging = false; commit(v); } };
+  f.onwheel = e => { e.preventDefault(); show(v + (e.deltaY < 0 ? 2 : -2)); later(); };
+  f.onkeydown = e => { const d = {ArrowUp:1, ArrowRight:1, ArrowDown:-1, ArrowLeft:-1, PageUp:10, PageDown:-10}[e.key];
+    if (d) show(v + d); else if (e.key === "Home") show(0); else if (e.key === "End") show(100); else return;
+    e.preventDefault(); later(); };
+  return {el:f, set(x) { if (!dragging) show(x); }, get dragging() { return dragging; }};
 }
-async function send(d, body) {
-  try { fill(d, await api("/api/volume/" + encodeURIComponent(d.dataset.host), body)); }
-  catch (e) { fill(d, {host:d.dataset.host, error:String(e.message || e)}); }
+const pad = v => String(v).padStart(3, " ");
+function strip(host) {
+  const el = E("div", "strip"), s = {el, h:{host}, busy:0};
+  const meter = vu(), sc = E("div", "scribble"), sub = E("small");
+  sc.append(E("span", "", host), sub); sc.title = host;
+  const solo = E("button", "key solo", "SOLO"), mute = E("button", "key mute", "MUTE");
+  const btns = E("div", "btns"); btns.append(solo, mute);
+  const ro = E("div", "readout", "--");
+  const fd = fader(host + " volume", v => { ro.textContent = pad(v); meter.set(s.h.muted ? 0 : v); },
+                   v => { if (v !== s.h.volume) send(host, {action:"set", value:v}); });
+  mute.onclick = () => send(host, {action:s.h.muted ? "unmute" : "mute"});
+  solo.onclick = () => toggleSolo(host);
+  el.append(E("span", "led"), meter.el, sc, btns, fd.el, ro, E("span", "label", "CH"));
+  return Object.assign(s, {meter, sub, solo, mute, fd, ro});
+}
+function fill(s, h) {
+  s.h = h;
+  s.el.classList.toggle("err", !!h.error); s.el.classList.toggle("muted", !!h.muted);
+  s.el.classList.toggle("busy", s.busy > 0);
+  s.sub.textContent = h.error || h.backend || "";
+  s.el.title = h.error ? h.host + ": " + h.error : "";
+  if (h.error) return;
+  s.mute.classList.toggle("on", !!h.muted); s.mute.setAttribute("aria-pressed", !!h.muted);
+  s.solo.classList.toggle("on", soloed.has(h.host)); s.solo.setAttribute("aria-pressed", soloed.has(h.host));
+  s.fd.set(h.volume); s.meter.set(h.muted ? 0 : h.volume);
+}
+async function send(host, body) {
+  const s = strips.get(host); s.busy++; s.el.classList.add("busy");
+  let h;
+  try { h = await api("/api/volume/" + encodeURIComponent(host), body); }
+  catch (e) { h = {host, error:String(e.message || e)}; }
+  s.busy--; fill(s, h); syncMaster();
+}
+const live = () => [...strips.values()].filter(s => !s.h.error);
+async function toggleSolo(host) {
+  if (!soloed.size) savedMute = new Map(live().map(s => [s.h.host, !!s.h.muted]));
+  soloed.has(host) ? soloed.delete(host) : soloed.add(host);
+  const jobs = [];
+  for (const s of live()) {
+    const want = soloed.size ? !soloed.has(s.h.host) : (savedMute.get(s.h.host) ?? !!s.h.muted);
+    if (want !== !!s.h.muted) jobs.push(send(s.h.host, {action:want ? "mute" : "unmute"}));
+    else fill(s, s.h);
+  }
+  if (!soloed.size) savedMute = null;
+  syncMaster();
+  await Promise.all(jobs);
+}
+function masterStrip() {
+  const el = E("div", "strip master"), ro = E("div", "readout", "--"), meter = vu();
+  const sc = E("div", "scribble"); sc.append(E("span", "", "MASTER"), E("small", "", "all hosts"));
+  const mute = E("button", "key mute", "MUTE"); mute.title = "Mute or unmute every host";
+  const clr = E("button", "key solo", "CLR"); clr.title = "Clear all solos";
+  const btns = E("div", "btns"); btns.append(clr, mute);
+  const fd = fader("All hosts volume", v => { ro.textContent = pad(v); meter.set(v); },
+                   v => live().forEach(s => s.h.volume !== v && send(s.h.host, {action:"set", value:v})));
+  mute.onclick = () => { const any = live().some(s => !s.h.muted);
+    live().forEach(s => !!s.h.muted !== any && send(s.h.host, {action:any ? "mute" : "unmute"})); };
+  clr.onclick = async () => { for (const h of [...soloed]) await toggleSolo(h); };
+  el.append(E("span", "led"), meter.el, sc, btns, fd.el, ro, E("span", "label", "MASTER"));
+  return {el, fd, mute, clr};
+}
+function syncMaster() {
+  if (!master) return;
+  const l = live();
+  master.fd.set(l.length ? Math.max(...l.map(s => s.h.volume)) : 0);
+  master.mute.classList.toggle("on", l.length > 0 && l.every(s => s.h.muted));
+  master.clr.classList.toggle("on", soloed.size > 0);
 }
 async function load() {
-  try { const hs = await api("/api/volume"); el.innerHTML = ""; hs.forEach(h => el.append(card(h)));
-        if (!hs.length) el.textContent = "No hosts."; }
-  catch (e) { el.textContent = "Error: " + (e.message || e); }
+  let hs;
+  try { hs = await api("/api/volume"); }
+  catch (e) { if (!strips.size) note("Error: " + (e.message || e)); return; }
+  if (!hs.length) { if (!strips.size) note("No hosts."); return; }
+  if (!strips.size) desk.innerHTML = "";
+  for (const h of hs) {
+    let s = strips.get(h.host);
+    if (!s) { s = strip(h.host); strips.set(h.host, s); desk.insertBefore(s.el, master ? master.el : null); }
+    if (!s.busy && !s.fd.dragging) fill(s, h);
+  }
+  if (!master) { master = masterStrip(); desk.append(master.el); }
+  syncMaster();
 }
 document.getElementById("reload").onclick = e => { e.preventDefault(); load(); };
 load();
+setInterval(() => { if (!document.hidden) load(); }, 30000);
 </script></body></html>
 '''
 
