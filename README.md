@@ -29,7 +29,8 @@ server-1         64 cores  load 0.10 0.07 0.07
 - **Traffic between hosts.** `tailmon flows` (or `--flows` in the live view, off by default) shows who
   talks to whom and how fast, with the TCP services behind each link, from tailscale's per-peer counters and `ss`.
 - **Electricity cost.** Each host's power draw and what it costs per 24 h (CZK by default), measured
-  by the server's own power meter where there is one, estimated otherwise.
+  by the server's power meter, a laptop's battery or a Mac's power telemetry where there is one, estimated
+  otherwise (from the CPUs' measured draw when RAPL is readable).
 - **htop in the browser.** `tailmon htop` opens a page with an htop of every Linux and macOS host side
   by side: cores, memory, swap and the busiest processes, live.
 - **Tailnet file tools.** `search` finds files by name and `grep` searches their contents across all
@@ -158,11 +159,28 @@ POWER            5 hosts  954 W  22.9 kWh 137 CZK/24h at 6 CZK/kWh  (measured: b
 
 The power comes, in this order, from the server's own power meter (ACPI `power_meter`, e.g. Intel Node
 Manager or HPE iLO, which measures the whole box at the wall), from the battery of a laptop running on it,
-or from an estimate, marked `≈`: a base for the chassis (laptop 4 W, desktop 25 W, server 60 W), each CPU
-package's rated power (RAPL's PL1, readable without root) at 15 % when idle up to 100 % as the load grows,
-0.15 W per GB of RAM, 6 W per hard disk and 2 W per SSD, the NVIDIA GPUs' own reading, then ÷ 0.88 for the
-power supply. Expect ±30 % for an estimate; on the htop page, hover the cost to see its parts. Macs get
-4 W plus up to 30 W with load.
+on a Mac from the power telemetry of the `AppleSmartBattery` service (MacBooks and recent Mac minis;
+refreshed every few tens of seconds), or from an estimate, marked `≈`:
+
+- a base for the chassis (laptop 4 W, desktop 25 W, server 60 W),
+- the CPUs: what they draw, measured by RAPL (`package-N` and `psys` in `/sys/class/powercap`) or by the
+  `zenergy` / `amd_energy` drivers on AMD, when readable; else each package's rated power (RAPL's PL1,
+  readable without root) at 15 % when idle up to 100 % as the load grows,
+- 0.15 W per GB of RAM, 6 W per hard disk and 2 W per SSD,
+- the GPUs' own reading (`nvidia-smi`, `amdgpu`),
+- then ÷ 0.88 for the power supply.
+
+Expect ±30 % for an estimate; on the htop page, hover the cost to see its parts. Macs without power
+telemetry get 4 W plus up to 30 W with load.
+
+Since 2020 the kernel makes RAPL's `energy_uj` readable by root only (a side-channel fix), so the CPU part
+is then the rated-power guess. To let the SSH user read it on a host, accepting that trade-off:
+
+```sh
+echo 'ACTION=="add", SUBSYSTEM=="powercap", RUN+="/bin/chmod a+r /sys%p/energy_uj"' |
+  sudo tee /etc/udev/rules.d/90-rapl.rules
+sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj   # now, until the next boot
+```
 
 The 24 h figure uses the mean of the readings seen since tailmon started (in a live view), or the current
 reading (in a snapshot). Set your price and the hosts you measured yourself in the config:
@@ -479,7 +497,7 @@ Nothing is required: with no config file, tailmon connects to each host the way 
 | (Mac)  | when tailmon itself runs on macOS, the local machine is probed too: CPU from `host_statistics`, RAM from `vm_stat` (used = app memory + wired + compressed, as in Activity Monitor), IO from `ioreg` and `netstat -ibn`, HDD from `mount` (an APFS container counted once) |
 | TOTAL  | storage summed over all hosts, shown only when at most one Linux host is offline or unreachable (then marked incomplete). Excluded and non-Linux peers don't count |
 | USERS  | `who`: interactive logins; people other than the SSH user are highlighted                        |
-| POWER  | the server's power meter (`/sys/class/hwmon/*/power1_average`), a discharging battery, or an estimate from RAPL's PL1, load, RAM, disks and `nvidia-smi` |
+| POWER  | the server's power meter (`/sys/class/hwmon/*/power1_average`), a discharging battery, a Mac's `AppleSmartBattery` telemetry, or an estimate from RAPL (measured, or PL1 and load), RAM, disks, `nvidia-smi` and `amdgpu` |
 | FLOWS  | with `--flows`: tailscaled's per-peer byte counters and `ss -ti` TCP sockets, merged from both ends of each link |
 | SLURM  | `sinfo` / `squeue`, when installed (refreshed at most every 10 s): node state and CPU allocation, then the job queue. Hosts reporting the same cluster show it once |
 

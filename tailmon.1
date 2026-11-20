@@ -649,10 +649,12 @@ when installed (refreshed at most every 10 seconds). Hosts reporting the same cl
 .B POWER
 Each host\(aqs header line shows its power and the energy and cost of 24 hours at that rate (the
 mean of the readings so far in a live view), and a POWER line sums all hosts. The power is read from
-the server\(aqs ACPI power meter, or from a laptop\(aqs battery while it discharges; otherwise it is
-estimated, and marked \(ap: a base for the chassis (laptop 4 W, desktop 25 W, server 60 W), each CPU
-package\(aqs rated power (RAPL PL1) scaled by load, 0.15 W per GB of RAM, 6 W per hard disk, 2 W per
-SSD and the NVIDIA GPUs\(aq reading, divided by 0.88 for the power supply. See
+the server\(aqs ACPI power meter, from a laptop\(aqs battery while it discharges, or on macOS from the
+AppleSmartBattery power telemetry; otherwise it is estimated, and marked \(ap: a base for the chassis
+(laptop 4 W, desktop 25 W, server 60 W), the CPUs (their measured draw from RAPL or the zenergy /
+amd_energy drivers when readable, else each package\(aqs rated power, RAPL PL1, scaled by load), 0.15 W
+per GB of RAM, 6 W per hard disk, 2 W per SSD and the GPUs\(aq own reading (NVIDIA, amdgpu), divided by
+0.88 for the power supply. RAPL\(aqs energy counters are root\-only on most kernels. See
 .BR kwh_price ", " currency " and " power
 under
 .BR CONFIGURATION .

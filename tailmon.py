@@ -113,10 +113,87 @@ def power_setup():
     i["batteries"] = [b for b in glob.glob("/sys/class/power_supply/*") if sysfs(b + "/type") == "Battery"]
     mem = sysfs("/proc/meminfo").split("\n")[0].split()
     i["ram_gb"] = int(mem[1]) / 2.0**20 if len(mem) > 1 and mem[1].isdigit() else 0.0
+    # Measured parts, used in the estimate in place of the rated figures: the CPU packages' energy counters
+    # (RAPL, Intel and AMD, or the zenergy / amd_energy drivers on AMD) and AMD GPUs' power reading.
+    i["rapl"] = [(d, sysfs(d + "/name"), int(sysfs(d + "/max_energy_range_uj", "0") or 0))
+                 for d in sorted(glob.glob("/sys/class/powercap/intel-rapl:[0-9]"))
+                 if sysfs(d + "/energy_uj").isdigit()]  # root-only on most kernels since 2020
+    i["zenergy"] = []
+    if not any(name.startswith("package") for _, name, _ in i["rapl"]):
+        for h in glob.glob("/sys/class/hwmon/hwmon*"):
+            if sysfs(h + "/name") in ("zenergy", "amd_energy"):
+                for f in sorted(glob.glob(h + "/energy*_input")):
+                    label = sysfs(f[:-6] + "_label")
+                    if label.startswith("Esocket"):  # the others are per core
+                        i["zenergy"].append((f, "package-" + label[7:]))
+    i["amdgpu"] = []
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        if sysfs(h + "/name") == "amdgpu":
+            for f in ("power1_average", "power1_input"):
+                if sysfs(h + "/" + f).isdigit():
+                    i["amdgpu"].append(h + "/" + f)
+                    break
 
-def power(util, gpu_watts=0.0, mac=False):
-    # {"watts", "source": meter | battery | estimate, "parts"} at util % of all CPUs.
+def energy_counters():
+    # {key: (domain name, µJ so far, wrap-around µJ)} of the CPU packages (and RAPL's psys platform domain)
+    if not power_info:
+        power_setup()
+    out = {}
+    for d, name, wrap in power_info["rapl"]:
+        v = sysfs(d + "/energy_uj")
+        if v.isdigit():
+            out[d] = (name, int(v), wrap)
+    for f, name in power_info["zenergy"]:
+        v = sysfs(f)
+        if v.isdigit():
+            out[f] = (name, int(v), 0)
+    return out
+
+def energy_watts(e0, e1, dt):
+    # {"cpu": W of all packages, "psys": W of the platform} between two energy_counters(); {} if unreadable
+    out = {}
+    for key, (name, v1, wrap) in e1.items():
+        if key not in e0 or dt <= 0:
+            continue
+        d = v1 - e0[key][1]
+        if d < 0:
+            d += wrap
+        if d >= 0:
+            k = "psys" if name == "psys" else "cpu" if name.startswith("package") else None
+            if k:
+                out[k] = out.get(k, 0.0) + d / 1e6 / dt
+    return out
+
+mac_cache = [0.0, None]
+
+def mac_power():
+    # The whole Mac's draw in W from the AppleSmartBattery power telemetry (laptops, and the PSU of recent
+    # Mac minis), refreshed by macOS every few tens of seconds, so asked at most every 10 s. None without it.
+    if time.time() - mac_cache[0] < 10:
+        return mac_cache[1]
+    mac_cache[0], mac_cache[1] = time.time(), None
+    import plistlib
+    try:
+        bats = plistlib.loads(subprocess.run(["ioreg", "-a", "-r", "-n", "AppleSmartBattery"],
+                                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                             timeout=10).stdout or b"<array/>")
+    except Exception:
+        return None
+    for b in bats:
+        t = b.get("PowerTelemetryData") or {}
+        mw = t.get("SystemLoad") or t.get("SystemPowerIn") or t.get("BatteryPower")
+        if mw:
+            mac_cache[1] = mw / 1000.0
+            break
+    return mac_cache[1]
+
+def power(util, gpu_watts=0.0, mac=False, rapl=None):
+    # {"watts", "source": meter | battery | telemetry | estimate, "parts"} at util % of all CPUs; rapl is
+    # energy_watts(), the CPUs' measured draw when readable.
     if mac:
+        w = mac_power()
+        if w:
+            return {"watts": w, "source": "telemetry"}
         cpu = 30.0 * max(0.0, min(1.0, util / 100.0)) ** 0.5  # Apple silicon: a few W idle, ~35 W flat out
         return {"watts": (POWER_BASE["mac"] + cpu) / 0.9, "source": "estimate", "kind": "mac",
                 "parts": {"base": POWER_BASE["mac"], "cpu": cpu}}
@@ -133,8 +210,16 @@ def power(util, gpu_watts=0.0, mac=False):
             w = int(p) / 1e6 if p.isdigit() else int(cur) * int(volt) / 1e12 if cur.isdigit() and volt.isdigit() else 0
             if w > 0:
                 return {"watts": w, "source": "battery"}
-    u = max(0.0, min(1.0, util / 100.0)) ** 0.5  # half the threads busy is most of the package power (turbo, HT)
-    parts = {"base": POWER_BASE[i["kind"]], "cpu": sum(t * (0.15 + 0.85 * u) for t in i["tdp"]),
+    rapl = rapl or {}
+    if rapl.get("cpu") or rapl.get("psys"):  # measured; psys (the platform) includes the packages
+        cpu, cpu_key = max(rapl.get("cpu", 0.0), rapl.get("psys", 0.0)), "cpu (RAPL)"
+    else:
+        u = max(0.0, min(1.0, util / 100.0)) ** 0.5  # half the threads busy is most of the package power (turbo, HT)
+        cpu, cpu_key = sum(t * (0.15 + 0.85 * u) for t in i["tdp"]), "cpu"
+    for f in i["amdgpu"]:
+        v = sysfs(f)
+        gpu_watts += int(v) / 1e6 if v.isdigit() else 0.0
+    parts = {"base": POWER_BASE[i["kind"]], cpu_key: cpu,
              "ram": 0.15 * i["ram_gb"], "disks": 6.0 * i["hdd"] + 2.0 * i["ssd"], "gpu": gpu_watts}
     return {"watts": sum(parts.values()) / 0.88, "source": "estimate", "kind": i["kind"], "parts": parts}
 '''
@@ -573,11 +658,11 @@ def flows(prev, cur, dt):
     return out
 
 def counters():
-    return time.time(), cpu_times(), disks_io(), net_io(), flow_counters()
+    return time.time(), cpu_times(), disks_io(), net_io(), flow_counters(), energy_counters()
 
 def report(prev, cur):
-    t0, (c0, i0), (dr0, dw0), (nr0, nt0), f0 = prev
-    t1, (c1, i1), (dr1, dw1), (nr1, nt1), f1 = cur
+    t0, (c0, i0), (dr0, dw0), (nr0, nt0), f0, e0 = prev
+    t1, (c1, i1), (dr1, dw1), (nr1, nt1), f1, e1 = cur
     dt = t1 - t0
     cpu = 100.0 * (1 - (i1 - i0) / max(c1 - c0, 1))
     gs = gpus()
@@ -588,7 +673,7 @@ def report(prev, cur):
         "disk_io": {"read": (dr1 - dr0) / dt, "write": (dw1 - dw0) / dt},
         "net_io": {"rx": (nr1 - nr0) / dt, "tx": (nt1 - nt0) / dt},
         "fs": filesystems(), "gpus": gs, "temps": temps(),
-        "power": power(cpu, sum(g["power"] or 0 for g in gs)),
+        "power": power(cpu, sum(g["power"] or 0 for g in gs), sys.platform == "darwin", energy_watts(e0, e1, dt)),
         "user": pwd.getpwuid(os.getuid()).pw_name, "sessions": sessions(), "slurm": slurm(),
         "flows": flows(f0, f1, dt),
     })
@@ -1345,6 +1430,7 @@ def render_total(results, skipped):
     lines = ["TOTAL            %d/%d hosts  %s" % (len(ok), len(ok) + len(missing), note)]
     lines += [hdd_line(fs_total([fs_total(r["fs"], "") for r in ok], "all hosts"))]
     return lines + [""]
+
 
 
 # Used when a sensor reports no limit of its own: Intel / AMD CPUs throttle around 85-100°C, NVIDIA GPUs
@@ -2434,12 +2520,12 @@ def linux():
         return {"total": m["MemTotal"], "used": m["MemTotal"] - m["MemFree"] - cache, "cache": cache,
                 "swap_total": m.get("SwapTotal", 0), "swap_used": m.get("SwapTotal", 0) - m.get("SwapFree", 0)}
 
-    c0, p0, t0 = cores(), procs(), time.time()
+    c0, p0, t0, e0 = cores(), procs(), time.time(), energy_counters()
     deadline = t0
     while True:
         deadline += INTERVAL
         time.sleep(max(0.0, deadline - time.time()))
-        c1, p1, t1 = cores(), procs(), time.time()
+        c1, p1, t1, e1 = cores(), procs(), time.time(), energy_counters()
         dt = max(t1 - t0, 1e-3)
         mem = memory()
         rows = []
@@ -2462,11 +2548,11 @@ def linux():
         with open("/proc/uptime") as f:
             uptime = float(f.read().split()[0])
         cpu = sum(cores_pct) / max(len(cores_pct), 1)
-        emit({"hostname": socket.gethostname(), "time": t1, "cores": cores_pct, "power": power(cpu, gpu_watts()),
+        emit({"hostname": socket.gethostname(), "time": t1, "cores": cores_pct, "power": power(cpu, gpu_watts(), rapl=energy_watts(e0, e1, dt)),
               "cpu": cpu, "mem": mem, "load": os.getloadavg(),
               "uptime": uptime, "tasks": len(p1), "threads": sum(v["thr"] for v in p1.values()),
               "running": sum(1 for v in p1.values() if v["s"] == "R"), "procs": rows, "me": user(os.getuid())})
-        c0, p0, t0 = c1, p1, t1
+        c0, p0, t0, e0 = c1, p1, t1, e1
 
 def seconds(text):
     """ps times: '1:02.03', '01:02:03', '2-01:02:03'."""
@@ -2620,6 +2706,7 @@ function procRow(p, me) {
     "</td><td>" + p.mem.toFixed(1) + "</td><td>" + cputime(p.time) + '</td><td class="cmd" title="' + esc(p.cmd) + '">' +
     '<span class="base">' + base + '</span><span class="args">' + args + "</span></td></tr>"; }
 const SOURCES = {meter:"measured by the machine's power meter", battery:"measured: battery discharge",
+                 telemetry:"measured by macOS's power telemetry",
                  config:"set in the config", estimate:"estimated"};
 function costHtml(e) {
   if (!e) return "";
