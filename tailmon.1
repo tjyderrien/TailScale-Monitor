@@ -89,6 +89,18 @@ tailmon \- agentless CPU, GPU, RAM, IO and disk monitor for the machines on a Ta
 .RB [ \-\-hosts
 .IR LIST ]
 .br
+.B tailmon sharpness
+.RB [ \-\-hosts
+.IR H1,H2 ]
+.RB [ \-\-exclude
+.IR H3 ]
+.RB [ \-\-servers
+.IR S1,S2 ]
+.RB [ \-\-offline ]
+.RB [ \-n
+.IR N ]
+.RB [ \-\-json ]
+.br
 .B tailmon completion
 .BR zsh | bash
 .SH DESCRIPTION
@@ -417,7 +429,10 @@ Mount each online Linux and macOS peer with
 at
 .IB ROOT / host
 (default root:
-.IR /media/tailscale ),
+.IR /media/tailscale ,
+or
+.I ~/tailscale
+on macOS, whose system disk is read\-only),
 so local programs can work on files from all machines at once.
 The local machine gets a symbolic link instead of a mount.
 Hosts that are already mounted are left alone; stale mounts of hosts that went away are
@@ -515,6 +530,40 @@ with the
 of the key line.
 .B mount
 keeps using your normal key: SFTP can\(aqt be narrowed down.
+.SS "sharpness"
+Score how well each online Linux or macOS machine is set up for remote work, by running
+.B env\-sharpness.py
+from BorderlineComputing on it (piped over SSH through a login shell, so the machine's own
+.B PATH
+counts; nothing is installed). Each machine gets a role
+.RB ( workstation ,
+.B server
+or
+.BR hpc ,
+guessed on the machine or set with
+.BR roles ),
+seven category scores, an overall score and the target of its role. Only machines below their
+target get a list of fixes, biggest gain first;
+.B setup\-env.py
+from the same repository applies the fewest of them that clear the target.
+.TP
+.BI \-\-hosts " H1,H2"
+Only score these machines.
+.TP
+.BI \-\-exclude " H3"
+Do not score these machines.
+.TP
+.BI \-\-servers " S1,S2"
+Machines each workstation is checked against (logins, mounts). Default: the online Linux machines, minus itself.
+.TP
+.B \-\-offline
+Skip the network checks on every machine.
+.TP
+.BI \-n " N"
+Fixes to list per machine below its target. Default 5.
+.TP
+.B \-\-json
+Print the full results.
 .SS "completion zsh|bash"
 Print a completion script, so that
 .B tailmon
@@ -672,6 +721,27 @@ your usual keys or agent.
 .TP
 .B exclude
 Tailscale hostnames never to probe or search.
+.TP
+.B env_sharpness
+Path of BorderlineComputing's
+.B env\-sharpness.py
+for
+.BR sharpness .
+Default
+.BR null :
+.B env\-sharpness
+on the
+.BR PATH .
+.TP
+.B roles
+Role per Tailscale hostname for
+.BR sharpness :
+.BR workstation ,
+.B server
+or
+.BR hpc .
+Unlisted machines guess their own.
+.TP
 .TP
 .B sample_seconds
 Measurement window for rates (CPU %, disk and network throughput) in snapshot mode. Default 1.0.

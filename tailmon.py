@@ -12,11 +12,12 @@ the local machine is probed directly.
     tailmon.py --hosts web-1,db-1
     tailmon.py volume 40          set every host's sound volume to 40 % (+5, -5, mute, toggle; nothing: show)
     tailmon.py serve              web page to control every host's volume, on http://<this-pc>:8765/
-    tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host> (umount to undo)
+    tailmon.py mount              sshfs-mount every peer at /media/tailscale/<host>, ~/tailscale on a Mac (umount to undo)
     tailmon.py gate install       let each host approve the scripts tailmon runs on it (own key + gate)
     tailmon.py tasks              the last 3 Todoist tasks each host ran (claude-explorer dispatch), read-only
     tailmon.py flows -w 2         live traffic between the hosts (also: tailmon.py -w 1 --flows)
     tailmon.py htop               web page with an htop of every host, on http://localhost:8766/
+    tailmon.py sharpness          score every machine for remote work (BorderlineComputing's env-sharpness)
 """
 import argparse
 import base64
@@ -44,6 +45,10 @@ DEFAULT_CONFIG = {
     # SSH private key passed with -i; null: ssh's usual keys / agent.
     "identity": None,
     "exclude": [],
+    # `tailmon sharpness`: path of BorderlineComputing's env-sharpness.py; null: `env-sharpness` on the PATH.
+    "env_sharpness": None,
+    # `tailmon sharpness`: role per Tailscale hostname (workstation, server or hpc); unlisted hosts guess their own.
+    "roles": {},
     "sample_seconds": 1.0,
     # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
     "discover_seconds": 30.0,
@@ -1079,19 +1084,28 @@ def render_file_results(operation, rows, errors, skipped, stats, as_json, verbos
 # ---------------------------------------------------------------------------------------------
 # Mounts: each peer's filesystem under one local directory via sshfs (FUSE, no root needed).
 # ---------------------------------------------------------------------------------------------
-MOUNT_ROOT = "/media/tailscale"
+IS_MAC = sys.platform == "darwin"
+# macOS's system disk is read-only (no /media there), so on a Mac the mounts go in your home.
+MOUNT_ROOT = "~/tailscale" if IS_MAC else "/media/tailscale"
 
 
 def mounted_paths():
-    """Mount points currently in /proc/mounts (with its octal escapes such as \\040 decoded)."""
+    """Mount points currently mounted: /proc/mounts on Linux (octal escapes such as \\040 decoded),
+    the `mount` command on macOS ("<source> on <point> (<type>, ...)")."""
+    if not os.path.exists("/proc/mounts"):
+        out = subprocess.run(["mount"], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        return {line.split(" on ", 1)[1].rsplit(" (", 1)[0] for line in out.splitlines() if " on " in line}
     with open("/proc/mounts") as f:
         return {line.split()[1].encode().decode("unicode_escape") for line in f}
 
 
 def fusermount(*args):
-    exe = shutil.which("fusermount3") or "fusermount"
-    return subprocess.run([exe] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          universal_newlines=True)
+    """fusermount -u[z] POINT on Linux; umount [-f] POINT on macOS, which has no fusermount."""
+    if IS_MAC:
+        cmd = ["umount"] + (["-f"] if "-uz" in args else []) + [a for a in args if not a.startswith("-")]
+    else:
+        cmd = [shutil.which("fusermount3") or "fusermount"] + list(args)
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
 
 def sshfs_cmd(node, cfg, remote, point):
@@ -1185,7 +1199,9 @@ def mount_main(argv):
         rows = unmount_all(root, only)
     else:
         if not shutil.which("sshfs"):
-            sys.exit("tailmon: sshfs is not installed (e.g. `sudo apt install sshfs`)")
+            sys.exit("tailmon: sshfs is not installed (e.g. `sudo apt install sshfs`; on macOS "
+                     "`brew install --cask macos-fuse-t/homebrew-cask/fuse-t && "
+                     "brew install macos-fuse-t/homebrew-cask/fuse-t-sshfs`)")
         # As root, ssh would use root's keys and log in as root: run as yourself instead.
         if os.geteuid() == 0:
             sys.exit("tailmon: don't run `mount` as root (no sudo); run it as your own user")
@@ -3201,6 +3217,131 @@ def tasks_main(argv):
                                                    "  [closed]" if r["completed"] else ""))
 
 
+# ---------------------------------------------------------------------------------------------
+# sharpness: run BorderlineComputing's env-sharpness.py on every machine and compare them
+# ---------------------------------------------------------------------------------------------
+SHARPNESS_OS = ("linux", "macOS")
+SHARPNESS_TIMEOUT = 180.0  # a machine checks login and mounts to every server, one after the other
+SHARPNESS_COLS = [("network", "net"), ("auth", "login"), ("ssh", "ssh"), ("files", "files"),
+                  ("tools", "tools"), ("shell", "shell"), ("toolkit", "toolkit")]
+
+
+def env_sharpness_source(cfg):
+    exe = os.path.expanduser(cfg.get("env_sharpness") or "") or shutil.which("env-sharpness")
+    if not exe or not os.path.isfile(exe):
+        sys.exit("tailmon: `sharpness` runs env-sharpness.py from BorderlineComputing "
+                 "(https://github.com/tjyderrien/BorderlineComputing).\n"
+                 "  Link it into the PATH as env-sharpness, or set \"env_sharpness\" in %s" % CONFIG_PATH)
+    with open(exe) as f:
+        return f.read()
+
+
+def sharpness_cmd(node, cfg, is_self, servers, offline):
+    role = (cfg.get("roles") or {}).get(node["name"])
+    args = ["-", "--json", "-"] + (["--hosts", ",".join(servers)] if servers else []) + \
+        (["--offline"] if offline else []) + (["--role", role] if role else [])
+    if is_self:
+        return [sys.executable] + args
+    ssh = ssh_base(node, cfg, keepalive=True)
+    # A login shell, so the machine is judged with the PATH its user really has (Homebrew on macOS, ~/.local/bin).
+    inner = " ".join(shlex.quote(v) for v in ["python3"] + args)
+    return ssh + ['exec "${SHELL:-/bin/sh}" -l -c %s' % shlex.quote(inner)]
+
+
+def sharpness_run(node, cfg, is_self, servers, offline, source):
+    try:
+        r = subprocess.run(sharpness_cmd(node, cfg, is_self, servers, offline), input=source,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=SHARPNESS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"node": node["name"], "error": "timeout after %.0f s" % SHARPNESS_TIMEOUT}
+    lines = [l for l in r.stdout.splitlines() if l.startswith("{")]  # login shells may print banners
+    if r.returncode != 0 or not lines:
+        err = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+        return {"node": node["name"], "error": err[:120]}
+    return dict(json.loads(lines[-1]), node=node["name"])
+
+
+def sharpness_color(text, score):
+    if not COLOR or score is None:
+        return text
+    return "\033[%sm%s\033[0m" % ("32" if score >= 90 else "33" if score >= 60 else "31", text)
+
+
+def sharpness_main(argv):
+    ap = argparse.ArgumentParser(prog="tailmon sharpness",
+                                 description="Score how sharp each machine of the tailnet is for remote work "
+                                             "(runs env-sharpness.py on each of them) and list what to fix.")
+    ap.add_argument("--hosts", help="comma-separated machines to score (default: every online Linux/macOS one)")
+    ap.add_argument("--exclude", help="comma-separated machines not to score")
+    ap.add_argument("--servers", help="comma-separated servers each machine is checked against "
+                                      "(default: the online Linux machines, minus itself)")
+    ap.add_argument("--offline", action="store_true", help="skip the network checks on every machine")
+    ap.add_argument("-n", "--fixes", type=int, default=5, metavar="N", help="fixes to list per machine (default 5)")
+    ap.add_argument("--json", action="store_true", help="print the full results as JSON")
+    a = ap.parse_args(argv[1:])
+    cfg = load_config()
+    source = env_sharpness_source(cfg)
+    only = set(a.hosts.split(",")) if a.hosts else None
+    exclude = set(a.exclude.split(",")) if a.exclude else set()
+
+    me, peers = discover()
+    nodes = [(me, True)] + [(p, False) for p in peers]
+    targets, skipped = [], []
+    for n, is_self in nodes:
+        if (only and n["name"] not in only) or n["name"] in exclude or n["name"] in cfg["exclude"]:
+            continue
+        if not is_self and (n["os"] not in SHARPNESS_OS or not n["online"]):
+            skipped.append(n)
+            continue
+        targets.append((n, is_self))
+    if a.servers:
+        servers = a.servers.split(",")
+    else:
+        servers = [n["name"] for n, s in nodes if n["name"] not in cfg["exclude"]
+                   and (s or (n["os"] == "linux" and n["online"]))]
+
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        futs = [ex.submit(sharpness_run, n, cfg, s, [h for h in servers if h != n["name"]], a.offline, source)
+                for n, s in targets]
+        results = [f.result() for f in futs]
+    if a.json:
+        print(json.dumps(results, indent=2))
+        return
+
+    ok = sorted((r for r in results if "error" not in r), key=lambda r: -(r["overall"] or 0))
+    print("tailmon sharpness  %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("%-16s %-11s %s  %7s  %s" % ("", "role", " ".join("%7s" % t for _, t in SHARPNESS_COLS), "OVERALL",
+                                         "target"))
+    for r in ok:
+        cells = []
+        for key, _ in SHARPNESS_COLS:
+            s = r["scores"].get(key)
+            cells.append(sharpness_color("%7s" % ("-" if s is None else "%.0f" % s), s))
+        above = r["overall"] > r.get("target", 0)
+        print("%-16s %-11s %s  %s  %s" % (
+            r["node"][:16], r.get("role", "?"), " ".join(cells),
+            sharpness_color("%7.1f" % r["overall"], r["overall"]),
+            sharpness_color("%s %g" % ("above" if above else "BELOW", r.get("target", 0)), 100 if above else 0)))
+    for r in results:
+        if "error" in r:
+            print("%-16s %s" % (r["node"][:16], sharpness_color("error: " + r["error"], 0)))
+    if skipped:
+        print("\nnot scored: " + ", ".join("%s (%s)" % (n["name"], "offline" if not n["online"] else n["os"])
+                                          for n in skipped))
+    # Machines above their target are fine as they are: only the ones below get a to-do list.
+    for r in ok:
+        fixes = sorted((c for c in r["checks"] if c.get("fix")), key=lambda c: -c["weight"] * (1 - c["value"]))
+        if not fixes or a.fixes <= 0 or r["overall"] > r.get("target", 0):
+            continue
+        print("\n%s - below its target; %d thing%s to fix, biggest gain first "
+              "(setup-env.py there picks the fewest that clear the target):"
+              % (r["node"], len(fixes), "s" * (len(fixes) > 1)))
+        for c in fixes[:a.fixes]:
+            print("  - %s\n      %s" % (c["name"], c["fix"]))
+    print()
+
+
 ZSH_COMPLETION = r'''#compdef tailmon
 # zsh completion for tailmon: `tailmon completion zsh`
 
@@ -3221,6 +3362,7 @@ _tailmon() {
         'umount:unmount what tailmon mount mounted'
         'gate:let each host approve the scripts tailmon runs on it'
         'tasks:the Todoist tasks each host ran'
+        'sharpness:score every machine for remote work'
         'completion:print a shell completion script'
     )
     if (( CURRENT == 2 )) && [[ $words[2] != -* ]]; then
@@ -3268,6 +3410,11 @@ _tailmon() {
     tasks)
         _arguments $common '(-n --last)'{-n,--last}'[tasks shown per host]:N' '--days[days of completed tasks]:days' \
             '--label[dispatch label]:label' '--json[print JSON]' ;;
+    sharpness)
+        _arguments $common '--exclude[machines not to score]:hosts:_tailmon_hosts' \
+            '--servers[machines each one is checked against]:hosts:_tailmon_hosts' \
+            '--offline[skip the network checks]' '(-n --fixes)'{-n,--fixes}'[fixes listed per machine]:N' \
+            '--json[print JSON]' ;;
     completion)
         _arguments '1:shell:(zsh bash)' ;;
     esac
@@ -3291,7 +3438,7 @@ _tailmon() {
         return
     fi
     if (( COMP_CWORD == 1 )); then
-        words="search grep volume serve mount umount gate tasks completion"
+        words="search grep volume serve mount umount gate tasks sharpness completion"
         [[ $cur == -* ]] && words="-w --watch --json --log --hosts --quiet --alert --help"
     else
         case ${COMP_WORDS[1]} in
@@ -3303,6 +3450,7 @@ _tailmon() {
         umount) words="--root --hosts --json --help" ;;
         gate) words="install approve status remove hashes --hosts --help" ;;
         tasks) words="-n --last --hosts --days --label --json --help" ;;
+        sharpness) words="--hosts --exclude --servers --offline -n --fixes --json --help" ;;
         completion) words="zsh bash" ;;
         esac
     fi
@@ -3339,6 +3487,8 @@ def main():
         return gate_main(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "tasks":
         return tasks_main(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "sharpness":
+        return sharpness_main(sys.argv[1:])
     flows_only = sys.argv[1:2] == ["flows"]
     argv = sys.argv[2:] if flows_only else sys.argv[1:]
     if flows_only:

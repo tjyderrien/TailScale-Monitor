@@ -328,9 +328,38 @@ network drops; running `mount` again only fills in missing or stale ones. `umoun
 Mounts don't survive a reboot: run `tailmon mount` again (e.g. from your session startup).
 Don't run it with `sudo`: it must use your own SSH keys and user.
 
+On a Mac the default root is `~/tailscale` (macOS's system disk is read-only, so there is no `/media`), and
+`mount` needs FUSE-T and its sshfs: `brew install --cask macos-fuse-t/homebrew-cask/fuse-t &&
+brew install macos-fuse-t/homebrew-cask/fuse-t-sshfs` (no kernel extension, no reboot). `umount` uses `umount`.
+
 On macOS, a search over SSH can't see `~/Documents`, `~/Desktop`, `~/Downloads` and other protected
 folders until you allow it: System Settings → General → Sharing → Remote Login → ⓘ → *Allow full disk
 access for remote users*.
+
+### Sharpness of every machine
+
+`tailmon sharpness` scores how well each online Linux or macOS machine is set up for remote work, by running
+[BorderlineComputing](https://github.com/tjyderrien/BorderlineComputing)'s `env-sharpness.py` on it (piped over
+SSH through a login shell, so the machine's own PATH counts; nothing is installed):
+
+```sh
+tailmon sharpness                     # one row per machine: role, 7 category scores, overall, target
+tailmon sharpness --hosts asus,mac-mini -n 10
+tailmon sharpness --servers biatri-1,biatri-2   # what each workstation is checked against
+tailmon sharpness --json
+```
+
+```
+                 role            net   login     ssh   files   tools   shell toolkit  OVERALL  target
+asus             workstation     100     100     100     100     100     100      71     95.9  above 90
+biatri-1         server          100      75      20     100      88      37       -     69.9  BELOW 80
+```
+
+Each machine is judged on what it is for: a `workstation` (target 90) must reach, log in to and mount the others;
+a `server` (80) needs good SSH and shell settings; `hpc` (70), a shared computing centre without sudo, only what one
+user can set up in `$HOME`. The machine guesses its role; set it with `"roles"` in the config. Only machines below
+their target get a list of fixes, and `setup-env.py` from BorderlineComputing applies the fewest that clear it.
+`env-sharpness.py` is found as `env-sharpness` on the PATH or through `"env_sharpness"` in the config.
 
 ### Tasks each host ran
 
@@ -418,6 +447,8 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `default_user`     | SSH user for hosts not listed in `users` (default `null`: your `~/.ssh/config` / local username) |
 | `identity`         | SSH private key passed with `-i` (default `null`: your usual SSH keys / agent)           |
 | `exclude`          | Tailscale hostnames never to probe                                                       |
+| `env_sharpness`    | BorderlineComputing's `env-sharpness.py`, run by `sharpness` (default `null`: `env-sharpness` on the PATH) |
+| `roles`            | Role per Tailscale hostname for `sharpness`: `workstation`, `server` or `hpc` (default: each machine guesses) |
 | `sample_seconds`   | Measurement window for rates (CPU %, disk / network throughput) in snapshot mode         |
 | `discover_seconds` | In watch mode, how often to re-run `tailscale status` to find new or departed hosts      |
 | `temp_high`        | Temperature limits in °C by kind (`cpu`, `gpu`, `disk`, `other`) or chip (`nvme`, `coretemp`, `nvidia`, …; a chip beats its kind), replacing the sensor's own limit (default `{}`) |
